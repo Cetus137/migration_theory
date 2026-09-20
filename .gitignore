@@ -1,0 +1,29 @@
+# Generated output. All of it is reproducible from the parameters, which the encoded
+# filename and the .npz both record -- 279 MB at the time this was written, mostly
+# animations.
+figures/
+
+# ...and the same formats anywhere else, in case a run is written outside figures/
+*.npz
+*.gif
+*.mp4
+*.webm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
