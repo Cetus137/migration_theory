@@ -21,12 +21,12 @@ so a badly chosen ``dt`` is caught before a run rather than discovered in the ou
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
 
-from .activity import advection
+from .activity import advection, field_gradient
 from .free_energy import FreeEnergy
 from .tissue import Tissue
 
@@ -62,6 +62,28 @@ class ExplicitEuler:
     """How cell velocities arise -- an :class:`~migration_theory.activity.ImposedVelocity`
     or :class:`~migration_theory.activity.ForceBalance`. ``None`` means passive."""
 
+    windowed: bool = False
+    """Compute each step on the cells' windows rather than over the whole grid.
+
+    The derivative of every term, the velocities and the advection are evaluated on
+    each cell's own patch and the update touches only the windows; the field beyond
+    them is zero. What remains grid-sized is the sum of squared fields the coupling
+    terms read, a few passes over the stack. The trajectory agrees with the dense one
+    to the tail the windows drop, below ``1e-6`` in the field.
+    """
+
+    refresh_every: int = 20
+    """Steps between recomputing the windows, when ``windowed``.
+
+    Cells move, so a window has to follow its cell. A refresh costs two passes over
+    the stack and must come before a cell has moved further than the window margin
+    of three points: at the fastest speed in these sweeps, about ``0.3 um/s``, and a
+    step of ``0.06 s``, that is one point in about fifty steps, so twenty is safe with
+    room to spare.
+    """
+
+    steps_taken: int = field(default=0, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.dt <= 0:
             raise ValueError(f"dt must be positive, got {self.dt}")
@@ -69,6 +91,8 @@ class ExplicitEuler:
             raise ValueError(f"friction must be positive, got {self.friction}")
         if not 0 < self.safety <= 1:
             raise ValueError(f"safety must lie in (0, 1], got {self.safety}")
+        if self.refresh_every < 1:
+            raise ValueError(f"refresh_every must be at least 1, got {self.refresh_every}")
 
     def stability_limits(self, tissue: Tissue, free_energy: FreeEnergy) -> dict[str, float]:
         """Each term's largest tolerable timestep, for seeing which one binds."""
@@ -142,18 +166,31 @@ class ExplicitEuler:
         barely changes step to step, so :func:`run` does it once up front.
         """
         fields = tissue.fields
-        mu = free_energy.functional_derivative(fields)
+        windows = patches = None
+        if self.windowed:
+            if fields.windows is None or self.steps_taken % self.refresh_every == 0:
+                fields.refresh_windows()
+            windows = fields.windows
+            # Gathered once and handed to everything below. Measured, gathering the
+            # patches afresh in every term was most of the windowed step's cost.
+            patches = windows.extract(fields.values)
+
+        mu = free_energy.functional_derivative(fields, windows, patches)
         rate = -mu / self.friction
         if self.propulsion is not None:
             # mu and the gradient are handed on rather than recomputed: under force
             # balance the velocity is built from the same functional derivative that
             # drives the relaxation, and the passive force and the advection both
             # need the same central gradient of the fields.
-            gradient = fields.gradient()
-            velocities = self.propulsion.velocities(tissue, mu, gradient)
-            rate = rate + advection(fields, velocities, gradient)
+            gradient = field_gradient(fields, windows, patches)
+            velocities = self.propulsion.velocities(tissue, mu, gradient, windows)
+            rate = rate + advection(fields, velocities, gradient, windows)
 
-        fields.values += self.dt * rate
+        if windows is None:
+            fields.values += self.dt * rate
+        else:
+            windows.add(self.dt * rate, fields.values)
+        self.steps_taken += 1
         tissue.polarity.rotate(self.dt)
         tissue.time += self.dt
 

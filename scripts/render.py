@@ -24,9 +24,43 @@ __all__ = [
     "energy_figure",
     "make_animation",
     "observables_figure",
+    "pair_correlation_figure",
     "sweep_figure",
     "save_animation",
 ]
+
+#: Neighbour distances of a hexagonal lattice, in units of the spacing: where g(r)
+#: would peak if the tissue were a crystal.
+HEXAGONAL_SHELLS = (1.0, np.sqrt(3.0), 2.0, np.sqrt(7.0), 3.0)
+
+
+def pair_correlation_figure(curves, spacing_label="cell spacings"):
+    """``g(r)`` for several runs on one pair of axes, with the hexagonal shells marked.
+
+    ``curves`` is a list of ``(name, x, g)`` with ``x`` in cell spacings. Ordered
+    values of one parameter, so the lines take the sequential ramp, light to dark.
+    The dotted verticals are the neighbour distances of a hexagonal lattice: peaks on
+    them mean crystalline order, a broad second peak between them a glass, no second
+    peak a fluid. ``g = 1`` is no structure.
+    """
+    plotstyle.use_style()
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    ramp = plotstyle.FIELD_CMAP(np.linspace(0.3, 1.0, max(len(curves), 2)))
+    for shell in HEXAGONAL_SHELLS:
+        ax.axvline(shell, color=plotstyle.INK_MUTED, lw=0.7, ls=":")
+    ax.axhline(1.0, color=plotstyle.BASELINE, lw=0.8)
+    for colour, (name, x, g) in zip(ramp, curves):
+        ax.plot(x, g, color=colour, label=name)
+    ax.set_xlim(0.0, max(float(np.max(x)) for _, x, _ in curves))
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel(f"separation  ({spacing_label})")
+    ax.set_ylabel("$g(r)$")
+    ax.set_title("Pair correlation of cell centres", loc="left", pad=8)
+    ax.grid(axis="y")
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    return fig
 
 
 def field_image(ax, field, grid, vmin=0.0, vmax=None, colorbar=None,
@@ -239,7 +273,7 @@ def observables_figure(series, label, reported):
             else:
                 ax.errorbar(values, heights, yerr=[s[key] for s in entry["spreads"]],
                             fmt="o-", color=colour, ms=5, capsize=3, label=entry.get("name"))
-            if key == "velocity_correlation_length" and "velocity_correlation_bound" in entry["states"][0]:
+            if key.startswith("velocity_correlation_length") and "velocity_correlation_bound" in entry["states"][0]:
                 # Separations stop at half the box, so a length sitting on this line
                 # is only a lower bound, not a measurement.
                 ax.plot(values, [s["velocity_correlation_bound"] for s in entry["states"]],

@@ -19,7 +19,8 @@
 #
 # FRAMES x grid points x 8 bytes is held in memory for rendering -- ~12 MB at 200
 # frames on an 85^2 grid, so 4G is generous. --time as for one sweep task, plus a
-# few minutes to render.
+# few minutes to render. Windowed (the default below), a 75-cell point at DURATION=5000
+# takes ~25 min; a 16-cell one at DURATION=10000 ~10 min.
 #
 # Edit the block below, then:   sbatch animate.sl
 
@@ -52,7 +53,7 @@ TIME_UNIT=s
 # numerics
 GRID_SPACING=1.0                    # dx in um; pure resolution, appears in no physical quantity
 SAFETY=0.4                          # fraction of the stability limit the timestep takes
-WINDOW=""                           # "--window" measures each cell on its own patch of the grid; same numbers, stage 1 of windowed storage
+WINDOW="--window"                   # each cell on its own patch: same physics to the 1e-6 tail it drops; 12-16x faster than dense at 50 cells (measured 2026-09-21). "" for dense
 
 # run
 SEED=0

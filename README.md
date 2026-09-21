@@ -131,7 +131,7 @@ velocity, to neighbours, or to their shape.
 | `grid_spacing` | `dx` | `L` | 1.0 | Grid spacing in µm. Pure resolution — appears in no physical quantity. See `Model.refine`. |
 | `timestep` | `dt` | `T` | `None` | `None` derives `dt` from the stability limit. Set it to override; it is still checked. |
 | `safety` | — | — | 0.4 | Fraction of the stability limit `dt` takes when `timestep` is unset. |
-| `window` | — | — | `False` | Measure each cell on its own patch of the grid rather than the whole box. Same numbers; first stage of windowed storage. `--window` on the command line. |
+| `window` | — | — | `False` | Compute each cell on its own patch of the grid rather than the whole box: derivatives, velocities, update and diagnostics. Agrees with dense to the tail below `1e-6` it drops; faster the larger the tissue. `--window` on the command line. |
 
 ---
 

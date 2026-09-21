@@ -73,6 +73,29 @@ def test_centre_of_mass_of_a_blob_straddling_the_boundary(grid):
         assert np.hypot(*offset) < 0.05
 
 
+def test_centre_of_mass_is_the_exact_centroid_for_an_asymmetric_blob(grid):
+    """The circular mean alone is biased by the third moment; the refinement must
+    remove it. Compare with the plain centroid of the same blob placed mid-box, where
+    no wrap is involved and the ordinary weighted mean is the truth."""
+    X, Y = grid.coordinates
+    Lx, Ly = grid.box.Lx, grid.box.Ly
+
+    def blob(cx, cy):
+        dx = grid.box.min_image(np.stack([X - cx, Y - cy], axis=-1))
+        # Skewed: a Gaussian core with a one-sided tail along +x. Narrow enough that
+        # nothing reaches half the box, so the plain mean of the mid-box copy is exact.
+        return np.exp(-(dx[..., 0] ** 2 + dx[..., 1] ** 2) / 0.3) * (1.0 + 0.8 * np.tanh(dx[..., 0]))
+
+    mid = blob(Lx / 2, Ly / 2)
+    truth = np.array([np.sum(mid * X), np.sum(mid * Y)]) / np.sum(mid)      # no wrap: plain mean
+    expected_shift = truth - np.array([Lx / 2, Ly / 2])                       # the skew's offset
+
+    for cx, cy in ((0.1, Ly / 2), (Lx - 0.2, 0.3), (Lx / 2, Ly - 0.1)):
+        recovered = grid.centre_of_mass(blob(cx, cy))
+        offset = grid.box.min_image(recovered - (np.array([cx, cy]) + expected_shift))
+        assert np.hypot(*offset) < 1e-9
+
+
 def test_centre_of_mass_of_an_empty_field_is_nan(grid):
     assert np.all(np.isnan(grid.centre_of_mass(np.zeros(grid.shape))))
 

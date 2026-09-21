@@ -38,24 +38,18 @@ __all__ = [
 # ``PhaseFields.windows`` and are the first stage of storing cells that way outright.
 
 
-def areas(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
-    """``(n_cells,)`` area of each cell, ``\\int phi_i^2``."""
+def areas(
+    fields: PhaseFields, windows: Windows | None = None, patches: np.ndarray | None = None
+) -> np.ndarray:
+    """``(n_cells,)`` area of each cell, ``\\int phi_i^2``.
+
+    ``patches`` is the windows' contents if the caller has gathered them already.
+    """
     if windows is None:
         return fields.grid.integrate(fields.values**2)
-    return (windows.extract(fields.values) ** 2).sum(axis=(-2, -1)) * fields.grid.cell_area
-
-
-def _padded(windows: Windows, patches: np.ndarray) -> np.ndarray:
-    """Windows with a one-point border for stencils.
-
-    Zero beyond the window, since the field there is below the window threshold --
-    unless the window spans the whole axis, in which case it is periodic like the
-    grid and the border wraps, so the degenerate window reproduces the dense result.
-    """
-    rows = "wrap" if windows.spans_rows else "constant"
-    cols = "wrap" if windows.spans_cols else "constant"
-    padded = np.pad(patches, ((0, 0), (1, 1), (0, 0)), mode=rows)
-    return np.pad(padded, ((0, 0), (0, 0), (1, 1)), mode=cols)
+    if patches is None:
+        patches = windows.extract(fields.values)
+    return (patches**2).sum(axis=(-2, -1)) * fields.grid.cell_area
 
 
 def perimeters(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
@@ -70,9 +64,7 @@ def perimeters(fields: PhaseFields, windows: Windows | None = None) -> np.ndarra
     if windows is None:
         d_dx, d_dy = grid.gradient(fields.values)
         return grid.integrate(np.hypot(d_dx, d_dy))
-    padded = _padded(windows, windows.extract(fields.values))
-    d_dx = (padded[:, 1:-1, 2:] - padded[:, 1:-1, :-2]) / (2.0 * grid.dx)
-    d_dy = (padded[:, 2:, 1:-1] - padded[:, :-2, 1:-1]) / (2.0 * grid.dy)
+    d_dx, d_dy = windows.gradient(windows.extract(fields.values))
     return np.hypot(d_dx, d_dy).sum(axis=(-2, -1)) * grid.cell_area
 
 
@@ -122,14 +114,12 @@ def contact_lengths(fields: PhaseFields, interface_width: float) -> np.ndarray:
 
 
 def centres_of_mass(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
-    """``(n_cells, 2)`` centroid of each cell, correct across the periodic boundary.
+    """``(n_cells, 2)`` centroid of each cell, exact across the periodic boundary.
 
-    The dense version has to average angles around the periodic circle, which is
-    exact for a symmetric cell but carries a small bias, third moment times
-    ``(2 pi / L)^2 / 6``, for an asymmetric one -- a few hundredths of a micron here.
-    A window never wraps internally, so the windowed version is the plain centroid
-    over unwrapped coordinates, wrapped once at the end: exact, and the two agree to
-    that bias rather than to rounding.
+    Dense: :meth:`Grid.centre_of_mass`, a circular-mean guess refined to the exact
+    centroid with minimum-image displacements. Windowed: a window never wraps
+    internally, so it is the plain centroid over unwrapped coordinates, wrapped once
+    at the end. The two agree to the tail the window drops.
     """
     if windows is None:
         return fields.grid.centre_of_mass(fields.values**2)

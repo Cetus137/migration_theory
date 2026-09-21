@@ -193,18 +193,19 @@ class Model:
     """Fraction of the stability limit to take when ``timestep`` is not given."""
 
     window: bool = False
-    """Measure each cell on its own window of the grid rather than over the whole box.
+    """Compute each cell on its own window of the grid rather than over the whole box.
 
-    A cell is non-zero on a few percent of a large grid, so working over the whole
-    box for every cell is where the time goes as the tissue grows. This is the first
-    stage of storing cells on windows outright: with it on, the per-snapshot
-    diagnostics -- area, perimeter, centre of mass -- run on each cell's patch, found
-    from the fields at every snapshot. The dynamics still use the dense arrays, so the
-    trajectory is identical and the saving is small for now. Results agree with the
-    dense path to the tail the window drops -- below ``1e-6`` in the field, about
-    ``1e-5`` relative in a perimeter -- except the centre of mass, where the windowed
-    value is the exact centroid and the dense one a circular mean with a small bias
-    for asymmetric cells. Off by default until the dynamics use windows too.
+    A cell is non-zero on a small part of a large grid, so working over the whole box
+    for every cell is where the time goes as the tissue grows. With this on, every
+    step evaluates the free-energy derivatives, the velocities and the advection on
+    each cell's patch and updates only that patch; the per-snapshot diagnostics run
+    on the patches too. The field beyond a window is held at zero, so the trajectory
+    agrees with the dense one to the tail that drops: below ``1e-6`` in the field per
+    step, which in an active tissue over a long run is enough to change *when* a
+    rearrangement happens but not the statistics of rearrangement.
+
+    Off by default while the dense arrays remain the backing store; the windows are
+    an overlay on them, so the saving is in time, not yet in memory.
     """
 
     def __post_init__(self) -> None:
@@ -457,11 +458,12 @@ class Model:
         """
         if self.timestep is not None:
             return ExplicitEuler(dt=self.timestep, friction=self.friction, safety=1.0,
-                                 propulsion=self.propulsion_rule())
+                                 propulsion=self.propulsion_rule(), windowed=self.window)
         return ExplicitEuler(
             dt=self.safety * self.max_stable_dt(tissue, free_energy),
             friction=self.friction,
             propulsion=self.propulsion_rule(),
+            windowed=self.window,
         )
 
     def replace(self, **changes) -> Model:

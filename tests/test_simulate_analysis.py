@@ -10,6 +10,7 @@ from migration_theory import (
     Snapshot,
     Trajectory,
     diffusion_coefficient,
+    drift_speed_ratio,
     load_trajectory,
     mean_squared_displacement,
     neighbour_exchange_rate,
@@ -19,8 +20,11 @@ from migration_theory import (
     shape_statistics,
     simulate,
     tissue_state,
+    pair_correlation,
+    structure,
     velocities,
     velocity_correlation,
+    velocity_correlations,
 )
 
 
@@ -159,6 +163,19 @@ def test_neighbour_graph_is_symmetric_and_hollow(model):
     assert not np.any(np.diag(adjacency))
 
 
+def test_normalised_exchange_rates_follow_from_the_raw_one(model):
+    active = model.replace(propulsion="force", active_energy=3.0, rotational_diffusion=1e-3)
+    trajectory = simulate(active, duration=200, warmup=25, n_snapshots=20, keep_fields=False)
+    rates = neighbour_exchange_rate(trajectory)
+    raw = rates["exchange_rate_per_cell"]
+    assert rates["exchanges_per_radius"] == pytest.approx(raw * active.cell_radius / active.free_speed)
+    assert rates["exchanges_per_persistence_time"] == pytest.approx(raw * active.persistence_time)
+    # A passive tissue has nothing to normalise by.
+    passive = neighbour_exchange_rate(simulate(model, duration=100, n_snapshots=5, keep_fields=False))
+    assert np.isnan(passive["exchanges_per_radius"])
+    assert np.isnan(passive["exchanges_per_persistence_time"])
+
+
 def test_a_settled_passive_tissue_exchanges_no_neighbours(model):
     """Zero rearrangement is the signature of a solid, and the baseline the active
     case has to be compared against."""
@@ -172,8 +189,13 @@ def test_tissue_state_returns_finite_numbers(model):
     state = tissue_state(trajectory)
     assert set(state) >= {"shape_index_mean", "diffusion_coefficient", "msd_exponent",
                           "measured_speed", "exchange_rate_per_cell", "occupancy",
-                          "velocity_correlation_length", "neighbour_velocity_correlation"}
-    assert all(np.isfinite(v) for v in state.values())
+                          "velocity_correlation_length", "neighbour_velocity_correlation",
+                          "hexatic_order", "g_second_peak"}
+    # This four-cell box is under one cell spacing to its half-length, so g(r) has no
+    # second shell to measure: that height is NaN by design, and everything else finite.
+    assert 0.5 * model.box.min_length < 1.5 * model.cell_spacing
+    assert np.isnan(state["g_second_peak"])
+    assert all(np.isfinite(v) for k, v in state.items() if k != "g_second_peak")
 
 
 # ----------------------------------------------------------------- velocity correlation
@@ -202,12 +224,108 @@ def _walk(model, velocity_of, n_frames=80, interval=10.0, seed=0):
                       max_dt=interval, steps=n_frames, wall_seconds=0.0)
 
 
+# ----------------------------------------------------------------- structure
+
+
+def _still(model, centres, contacts, n_frames=5):
+    """A trajectory whose cells sit at ``centres`` with the given contacts, unmoving."""
+    n = len(centres)
+    snapshots = [
+        Snapshot(step=k, time=10.0 * k, energy=0.0, breakdown={}, area_ratio=1.0,
+                 shape_index=3.8, confluence=0.0, occupancy=1.0, centres=centres.copy(),
+                 areas=np.ones(n), perimeters=np.ones(n), contacts=contacts.copy())
+        for k in range(n_frames)
+    ]
+    return Trajectory(model=model, snapshots=snapshots, tissue=None, dt=10.0, max_dt=10.0,
+                      steps=n_frames, wall_seconds=0.0)
+
+
+def _contacts_by_distance(centres, box, cutoff):
+    """A contact matrix that is 1 for pairs closer than ``cutoff``."""
+    d = box.min_image(centres[:, None, :] - centres[None, :, :])
+    close = (np.hypot(d[..., 0], d[..., 1]) < cutoff).astype(float)
+    np.fill_diagonal(close, 0.0)
+    return close
+
+
+def test_a_hexagonal_lattice_is_ordered_with_peaks_on_the_shells():
+    """7 x 8 cells on a triangular lattice fitted to a 7 x 7 box: the rows are
+    squeezed by 1 % to make it periodic, so the order is near-perfect rather than
+    perfect, and the shells sit at 1 and ~1.74 spacings."""
+    n_cols, n_rows = 7, 8
+    n = n_cols * n_rows
+    # grid_spacing 0.5 so the 7 um box is 14 points: the model insists on at least 8.
+    model = Model(n_cells=n, cell_radius=0.5, packing=n * np.pi * 0.25 / 49.0, grid_spacing=0.5)
+    assert model.box.Lx == pytest.approx(7.0) and model.box.Ly == pytest.approx(7.0)
+    col, row = np.meshgrid(np.arange(n_cols), np.arange(n_rows), indexing="xy")
+    centres = np.column_stack([
+        ((col + 0.5 * (row % 2)) * 7.0 / n_cols).ravel(),
+        (row * 7.0 / n_rows).ravel(),
+    ])
+    trajectory = _still(model, centres, _contacts_by_distance(centres, model.box, 1.3))
+
+    s = structure(trajectory, transient=0.0)
+    assert s["hexatic_order"] > 0.98
+    assert s["hexagon_fraction"] == pytest.approx(1.0)
+
+    r, g = pair_correlation(trajectory, transient=0.0)
+    x = r / model.cell_spacing
+    # Peaks at the first two shells and nothing in between. The strain puts the two
+    # nearest-neighbour distances, 1.000 and 1.008 spacings, either side of a bin edge,
+    # so judge each shell by its highest bin in a window, not by the bin nearest it.
+    assert g[(x > 0.85) & (x < 1.15)].max() > 4.0
+    assert g[(x > 1.6) & (x < 1.9)].max() > 3.0
+    assert np.all(g[(x > 1.15) & (x < 1.55)] < 0.5)
+
+
+def test_random_positions_have_no_order():
+    model = Model(n_cells=64, cell_radius=0.5, packing=0.3)
+    rng = np.random.default_rng(0)
+    centres = rng.uniform(0.0, 1.0, (64, 2)) * model.box.lengths
+    contacts = _contacts_by_distance(centres, model.box, 1.5 * model.cell_spacing)
+    s = structure(_still(model, centres, contacts), transient=0.0)
+    assert s["hexatic_order"] < 0.6          # a perfect lattice would give 1
+    assert s["hexagon_fraction"] < 0.5
+    r, g = pair_correlation(_still(model, centres, contacts), transient=0.0)
+    # Uniform points: g averages to 1 beyond the first bins, with counting noise.
+    assert np.mean(g[len(g) // 3:]) == pytest.approx(1.0, abs=0.3)
+
+
 def test_velocities_have_no_net_drift():
-    """The tissue's own motion is subtracted, whatever it is."""
+    """The tissue's own motion is subtracted, whatever it is -- and reported."""
     model = Model(n_cells=16)
     drifting = _walk(model, lambda x, rng: np.tile(rng.normal(0, 0.1, 2), (len(x), 1)))
     _, velocity, _ = velocities(drifting, transient=0.0)
     assert np.abs(velocity).max() < 1e-9
+    assert drift_speed_ratio(drifting, transient=0.0) == pytest.approx(1.0)
+    independent = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape))
+    assert drift_speed_ratio(independent, transient=0.0) < 0.5
+
+
+def test_velocity_over_a_lag_is_the_displacement_over_that_lag():
+    model = Model(n_cells=16)
+    walk = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape), n_frames=30, interval=10.0)
+    times, v4, positions4 = velocities(walk, transient=0.0, lag=4)
+    _, v1, _ = velocities(walk, transient=0.0, lag=1)
+    assert v4.shape[0] == v1.shape[0] - 3
+    # Four consecutive one-lag velocities average to the four-lag one (equal intervals).
+    stacked = np.stack([v1[k:k + v4.shape[0]] for k in range(4)]).mean(axis=0)
+    assert v4 == pytest.approx(stacked, abs=1e-12)
+    with pytest.raises(ValueError):
+        velocities(walk, transient=0.0, lag=30)
+
+
+def test_correlations_are_reported_at_every_lag_and_nan_when_too_short():
+    model = Model(n_cells=16)
+    walk = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape), n_frames=15)
+    out = velocity_correlations(walk, transient=0.0)
+    for lag in (1, 4, 10):
+        assert np.isfinite(out[f"velocity_correlation_length_lag{lag}"])
+        # The synthetic tissue has no contacts, so the first-shell value is undefined.
+        assert np.isnan(out[f"neighbour_velocity_correlation_lag{lag}"])
+    assert np.isnan(out["velocity_correlation_length_lag20"])   # 15 frames cannot hold a lag of 20
+    assert out["velocity_correlation_length"] == out["velocity_correlation_length_lag1"]
+    assert 0.0 <= out["drift_speed_ratio"] <= 1.0
 
 
 def test_velocity_correlation_starts_at_one_and_is_short_for_independent_cells():

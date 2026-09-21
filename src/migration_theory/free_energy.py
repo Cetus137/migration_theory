@@ -23,7 +23,24 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from .diagnostics import areas
-from .fields import PhaseFields
+from .fields import PhaseFields, Windows
+
+# Every term's ``functional_derivative`` takes an optional ``windows``. Without it the
+# derivative is the dense ``(n_cells, ny, nx)`` stack, the reference. With it, the
+# derivative is computed on each cell's own patch and returned as ``(n_cells, h, w)``,
+# the same numbers where the cell is and nothing spent where it is not. The two terms
+# that couple cells need one grid-sized quantity each, the sum of squared fields and
+# its Laplacian; :class:`FreeEnergy` builds those once per step and passes them down
+# as ``shared``, so no term computes them twice. ``shared`` also carries the patches
+# themselves, gathered from the dense stack once per step: measured, gathering them
+# afresh in every term was most of the windowed step's cost.
+
+
+def _patches(fields: PhaseFields, windows: Windows, shared: dict | None) -> np.ndarray:
+    """The patch stack: the one already gathered this step if there is one."""
+    if shared is not None and "patches" in shared:
+        return shared["patches"]
+    return windows.extract(fields.values)
 
 __all__ = [
     "FreeEnergyTerm",
@@ -46,8 +63,11 @@ class FreeEnergyTerm(Protocol):
     def energy(self, fields: PhaseFields) -> float:
         """The term's total contribution, a single number."""
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
-        """``delta F / delta phi_i`` for every cell, ``(n_cells, ny, nx)``."""
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
+        """``delta F / delta phi_i`` for every cell: ``(n_cells, ny, nx)``, or
+        ``(n_cells, h, w)`` patches when ``windows`` is given."""
 
     # Terms may additionally provide:
     #     density(fields) -> (ny, nx)
@@ -124,10 +144,15 @@ class DoubleWell:
     def energy(self, fields: PhaseFields) -> float:
         return float(fields.grid.integrate(self.density(fields)))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
         """Just ``dG/dphi``: the well contains no derivatives of the field, so its
-        variational derivative is the ordinary one."""
-        return self.gradient(fields.values)
+        variational derivative is the ordinary one -- pointwise, so on a window it is
+        the same function of the patch."""
+        if windows is None:
+            return self.gradient(fields.values)
+        return self.gradient(_patches(fields, windows, shared))
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma / alpha``.
@@ -185,8 +210,12 @@ class GradientEnergy:
     def energy(self, fields: PhaseFields) -> float:
         return float(fields.grid.integrate(self.density(fields)))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
-        return -self.K * fields.grid.laplacian(fields.values)
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
+        if windows is None:
+            return -self.K * fields.grid.laplacian(fields.values)
+        return -self.K * windows.laplacian(_patches(fields, windows, shared))
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma dx**2 / (4 K)`` on a square grid -- usually the binding constraint.
@@ -254,10 +283,20 @@ class Repulsion:
     def energy(self, fields: PhaseFields) -> float:
         return float(fields.grid.integrate(self.density(fields)))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
-        squared = fields.values**2
-        others = squared.sum(axis=0) - squared            # sum_{j != k} phi_j^2 for every k
-        return 2.0 * self.epsilon * fields.values * others
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
+        if windows is None:
+            squared = fields.values**2
+            others = squared.sum(axis=0) - squared        # sum_{j != k} phi_j^2 for every k
+            return 2.0 * self.epsilon * fields.values * others
+        # On windows the same identity: cell k needs S = sum_j phi_j^2 only where k is.
+        patch = _patches(fields, windows, shared)
+        if shared is not None and "squared_sum" in shared:
+            total = shared["squared_sum"]
+        else:
+            total = windows.accumulate(patch**2, np.zeros(fields.grid.shape))
+        return 2.0 * self.epsilon * patch * (windows.extract_field(total) - patch**2)
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma / (eps max_k sum_{j!=k} phi_j^2)``.
@@ -347,11 +386,26 @@ class Adhesion:
             return 0.0
         return float(fields.grid.integrate(self.density(fields)))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
+        if windows is None:
+            if self.omega == 0:
+                return np.zeros_like(fields.values)
+            laplacian = fields.grid.laplacian(fields.values**2)
+            return -2.0 * self.omega * fields.values * (laplacian.sum(axis=0) - laplacian)
         if self.omega == 0:
-            return np.zeros_like(fields.values)
-        laplacian = fields.grid.laplacian(fields.values**2)
-        return -2.0 * self.omega * fields.values * (laplacian.sum(axis=0) - laplacian)
+            return np.zeros((fields.n_cells, *windows.shape))
+        # sum_j lap(phi_j^2) = lap(sum_j phi_j^2) by linearity: one Laplacian of the
+        # shared sum, read through the windows, minus each cell's own on its patch.
+        patch = _patches(fields, windows, shared)
+        if shared is not None and "squared_sum_laplacian" in shared:
+            total = shared["squared_sum_laplacian"]
+        else:
+            squared_sum = windows.accumulate(patch**2, np.zeros(fields.grid.shape))
+            total = fields.grid.laplacian(squared_sum)
+        own = windows.laplacian(patch**2)
+        return -2.0 * self.omega * patch * (windows.extract_field(total) - own)
 
     def coupling_strength(self, fields: PhaseFields) -> float:
         """``max(4 phi_i phi_j)`` over the grid and over pairs.
@@ -457,22 +511,30 @@ class AreaConstraint:
         if self.lambda_ < 0:
             raise ValueError(f"lambda_ must be non-negative, got {self.lambda_}")
 
-    def mismatch(self, fields: PhaseFields) -> np.ndarray:
+    def mismatch(
+        self, fields: PhaseFields, windows: Windows | None = None, patches: np.ndarray | None = None
+    ) -> np.ndarray:
         """``(n_cells,)`` fractional area error ``1 - A_i/A_0``. Positive = too small.
 
         Worth watching directly: it says how well the soft constraint is holding, which
         no single energy number tells you.
         """
         target = np.asarray(self.target_area, dtype=float)
-        return 1.0 - areas(fields) / target
+        return 1.0 - areas(fields, windows, patches) / target
 
     def energy(self, fields: PhaseFields) -> float:
         return float(self.lambda_ * np.sum(self.mismatch(fields) ** 2))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
+    def functional_derivative(
+        self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
+    ) -> np.ndarray:
         target = np.asarray(self.target_area, dtype=float)
-        factor = -4.0 * self.lambda_ * self.mismatch(fields) / target
-        return np.reshape(factor, (-1, 1, 1)) * fields.values
+        if windows is None:
+            factor = -4.0 * self.lambda_ * self.mismatch(fields) / target
+            return np.reshape(factor, (-1, 1, 1)) * fields.values
+        patch = _patches(fields, windows, shared)
+        factor = -4.0 * self.lambda_ * self.mismatch(fields, windows, patch) / target
+        return np.reshape(factor, (-1, 1, 1)) * patch
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma A_0 / (4 lambda)``.
@@ -539,11 +601,57 @@ class FreeEnergy:
         """The total free energy, a single number."""
         return float(sum(term.energy(fields) for term in self.terms))
 
-    def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
-        total = np.zeros_like(fields.values)
+    def functional_derivative(
+        self,
+        fields: PhaseFields,
+        windows: Windows | None = None,
+        patches: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """The summed derivative: dense, or on windows when ``windows`` is given.
+
+        On windows the quantities every term shares are built here once and handed
+        down as ``shared``: the patches themselves, gathered from the dense stack
+        (or taken from ``patches`` if the caller already has them), the sum of squared
+        fields accumulated from those patches, and its Laplacian if any term has
+        adhesion. The last is the only grid-sized work left in a windowed step.
+        """
+        if windows is None:
+            total = np.zeros_like(fields.values)
+            for term in self.terms:
+                total += term.functional_derivative(fields)
+            return total
+        shared = self.shared_quantities(fields, windows, patches)
+        total = np.zeros((fields.n_cells, *windows.shape))
         for term in self.terms:
-            total += term.functional_derivative(fields)
+            total += term.functional_derivative(fields, windows, shared)
         return total
+
+    def shared_quantities(
+        self,
+        fields: PhaseFields,
+        windows: Windows | None = None,
+        patches: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """What every term reads on a windowed step, built once.
+
+        ``patches`` is the ``(n_cells, h, w)`` stack of the cells' windows -- gathered
+        here if the caller has not already -- and ``squared_sum`` is ``sum_j phi_j^2``
+        accumulated from it onto the grid, so no term touches the dense stack. The
+        Laplacian adhesion needs is of that one shared field and stays grid-sized,
+        which is cheap. Dense: only the sum, from the stack.
+        """
+        if windows is None:
+            shared = {"squared_sum": (fields.values**2).sum(axis=0)}
+        else:
+            if patches is None:
+                patches = windows.extract(fields.values)
+            shared = {
+                "patches": patches,
+                "squared_sum": windows.accumulate(patches**2, np.zeros(fields.grid.shape)),
+            }
+        if any(isinstance(term, Adhesion) and term.omega > 0 for term in self.terms):
+            shared["squared_sum_laplacian"] = fields.grid.laplacian(shared["squared_sum"])
+        return shared
 
     def density(self, fields: PhaseFields) -> np.ndarray:
         """Energy density of the local terms only.

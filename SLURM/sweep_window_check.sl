@@ -1,29 +1,39 @@
 #!/bin/bash
 #SBATCH --job-name      win_check
 #SBATCH --partition     short
-#SBATCH --mem           2G
-#SBATCH --time          01:00:00
+#SBATCH --mem           4G
+#SBATCH --time          04:00:00
 #SBATCH --cpus-per-task 1
-#SBATCH --array         0-49
+#SBATCH --array         0-5
 #SBATCH --output        slogs/win_check.%A_%a.out
 #SBATCH --exclude       compg009,compg010,compg011,compg013
-# Run the 16-cell activity sweep twice from the same code -- tasks 0-24 dense into
-# figures/window_check_dense, tasks 25-49 with --window into figures/window_check_win --
-# so the two sets differ in nothing but the flag and can be compared file by file with
-# compare_window.sl. The dynamics are untouched by the flag at this stage, so the
-# energies must agree to rounding and the diagnostics to the tail the window drops.
+# Run the same points twice from the same code -- the first N_POINTS tasks dense into
+# figures/window_check_<LABEL>_dense, the next N_POINTS with --window into
+# figures/window_check_<LABEL>_win -- so the two sets differ in nothing but the flag
+# and can be compared with compare_window.sl. With the dynamics on windows the two
+# trajectories agree to the dropped tail and then, in the fluid phase, may part company
+# on when rearrangements happen; the comparison is of the observables, and of the wall
+# time, which is the point of the windows.
 #
-# Both sets are run fresh rather than reusing figures/activity_eps40: that sweep was
-# made before the repulsion rewrite, and over 133k steps a rounding difference in an
-# active tissue can move a rearrangement, which would look like a failure and is not.
+# Measured 2026-09-21 at 16 cells (LABEL=N16, 25 points, DURATION=10000): identical
+# energies to 1e-8 for the whole run at every activity up to 21, observables within
+# noise everywhere, speedup 1.17x median -- modest because at 16 cells the window is
+# two thirds of the box. The saving grows with the box: this configuration is the 50-cell
+# measurement, three activities, where the window is about a fifth of the box.
 #
-# 50 points at ~20 min each. Then:   sbatch --dependency=afterany:<JOBID> compare_window.sl
+# --array must be 0 to (2 * N_POINTS - 1). Then:
+#   sbatch --dependency=afterany:<JOBID> compare_window.sl     (with the same LABEL)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 REPO=/users/kir-fritzsche/aif490/devel/migration_theory
+LABEL=${LABEL:-N50_stage3b}         # names the pair of output folders; use it in compare_window.sl too.
+                                    # Override without editing:  sbatch --export=ALL,LABEL=xyz sweep_window_check.sl
+                                    # N50 = stage 2 windows; N50_stage3 = shared sum from windows (loop);
+                                    # N50_stage3b = one gather per step + bincount accumulation
 
 OVER=active-energy
-VALUES=$(seq -s ' ' 0 1.5 36)       # 25 values, as the activity_eps40 sweep
+VALUES="0 12 24"                    # solid, transition, fluid; 3 points -> N_POINTS=3, --array 0-5
+N_POINTS=3
 SEEDS="0"                           # one seed is enough for a file-by-file comparison
 
 ALPHA=0.5
@@ -33,7 +43,7 @@ ADHESION=0.0
 AREA_LAMBDA=6000
 CELL_RADIUS=12
 PACKING=1.0
-N_CELLS=16
+N_CELLS=50                          # box 150 um = 150^2 points; a window is ~69 points, a fifth of the area
 SEEDING=tessellated
 FRICTION=10
 PROPULSION=force
@@ -45,20 +55,19 @@ TIME_UNIT=s
 GRID_SPACING=1.0
 SAFETY=0.4
 
-DURATION=10000
+DURATION=2500                       # dense at 50 cells is ~50 ms/step: ~35 min for 38k steps on a quiet node
 WARMUP=25
 SNAPSHOTS=200
-TRANSIENT=0.2
+TRANSIENT=0.3
 
 # the two halves of the array: same point, with and without the flag
-N_POINTS=25
 POINT=$(( SLURM_ARRAY_TASK_ID % N_POINTS ))
 if [ ${SLURM_ARRAY_TASK_ID} -lt ${N_POINTS} ]; then
     WINDOW=""
-    TAG=window_check_dense
+    TAG=window_check_${LABEL}_dense
 else
     WINDOW="--window"
-    TAG=window_check_win
+    TAG=window_check_${LABEL}_win
 fi
 
 module purge

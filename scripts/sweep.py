@@ -17,6 +17,17 @@ Usage::
         --over adhesion --values 0 0.2 0.4 0.6 --seeds 0 1 2 \\
         --propulsion force --epsilon 40 --duration 5000 --warmup 25 --figure
 
+    # the collapse test: dimensionless activity E_a/(sigma R) against tension, the
+    # tension set through alpha and K at fixed interface width
+    python scripts/sweep.py --over activity --values 0 1 2 3 4 5 6 8 \\
+        --over tension --values 0.1 0.2357 0.5 1.0 \\
+        --propulsion force --epsilon 40 --duration 5000 --figure
+
+    # force or speed? the same free speed on every line, the force rising with friction
+    python scripts/sweep.py --over free-speed --values 0 0.05 0.1 0.15 0.2 \\
+        --over cell-friction --values 3 10 30 \\
+        --propulsion force --epsilon 40 --duration 5000 --figure
+
     # a passive sweep: how the steady state depends on density
     python scripts/sweep.py --over packing --values 0.7 0.9 1.1 1.3 \\
         --duration 3000 --states
@@ -64,28 +75,89 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from naming import add_model_argument, argument_type, encode
 from progress import every_tenth
-from migration_theory import Model, load_trajectory, save_trajectory, simulate, tissue_state
+from migration_theory import (
+    Model,
+    interface_terms,
+    load_trajectory,
+    save_trajectory,
+    simulate,
+    tissue_state,
+)
 
 #: What to print, and what to plot. Keys are `tissue_state` entries.
 REPORTED = (
     ("msd_exponent", "MSD exponent"),
     ("diffusion_coefficient", "D"),
     ("exchange_rate_per_cell", "T1 rate per cell"),
+    ("exchanges_per_radius", "T1 per radius crawled"),
+    ("exchanges_per_persistence_time", "T1 per persist. time"),
     ("shape_index_mean", "shape index q"),
     ("shape_index_std", "q spread"),
     ("measured_speed", "measured speed"),
-    ("velocity_correlation_length", "v corr length (um)"),
-    ("neighbour_velocity_correlation", "neighbour v corr"),
+    ("velocity_correlation_length", "v corr length, lag 1 (um)"),
+    ("velocity_correlation_length_lag10", "v corr length, lag 10 (um)"),
+    ("neighbour_velocity_correlation", "neighbour v corr, lag 1"),
+    ("neighbour_velocity_correlation_lag10", "neighbour v corr, lag 10"),
+    ("drift_speed_ratio", "drift / cell speed"),
+    ("hexatic_order", "hexatic |psi6|"),
+    ("g_second_peak", "g(r) 2nd peak"),
     ("occupancy", "max occupancy"),
     ("confluence", "confluence error"),
 )
 
 _FIELDS = {f.name: f for f in dataclasses.fields(Model)}
 
+#: Quantities that are not model fields but are what one wants to sweep. Each sets
+#: one or more fields from its value; the filename still records the fields, so the
+#: runs stay self-describing.
+#:
+#: ``tension``   the surface tension sigma, at the base model's interface width:
+#:               sets alpha and K through ``interface_terms``. The natural axis for
+#:               "how strongly is the tissue held together", since alpha and K on
+#:               their own are a basis rather than a description.
+#: ``activity``  the dimensionless activity E_a / (sigma R): sets active_energy from
+#:               the tension *after* any tension in the same point has been applied,
+#:               so a grid over tension and activity spans the same range of the
+#:               dimensionless group on every tension line. That is what makes a
+#:               collapse test possible: if the transition is at one value of this
+#:               group at every tension, the model has one control parameter.
+#: ``free_speed`` the speed of an unobstructed cell, E_a / (R xi): sets active_energy
+#:               as v R xi from the cell friction of the same point. A grid over
+#:               free_speed and cell_friction holds the speed fixed along each line
+#:               while the force E_a / R = v xi rises with the friction -- the test of
+#:               whether the transition is set by how hard a cell pushes or how fast
+#:               it would move. Not with ``activity``: both set active_energy.
+PSEUDO = ("tension", "activity", "free_speed")
+
 #: The fields a sweep can take. The string-valued ones -- seeding, propulsion,
 #: time_unit -- and the flags are choices rather than quantities, so they are held
 #: fixed instead.
-SWEEPABLE = [name for name, f in _FIELDS.items() if not isinstance(f.default, (str, bool))]
+SWEEPABLE = [name for name, f in _FIELDS.items()
+             if not isinstance(f.default, (str, bool))] + list(PSEUDO)
+
+
+def apply_point(base: Model, fields, combination) -> Model:
+    """The model at one point of the sweep: the base with the swept values put in.
+
+    Plain fields go straight into ``replace``. ``tension`` then rewrites alpha and K
+    at the base's interface width, and ``activity`` last, since it reads the tension.
+    """
+    values = dict(zip(fields, combination))
+    if "activity" in values and "free_speed" in values:
+        raise SystemExit("activity and free_speed both set active_energy; sweep one of them")
+    model = base.replace(**{f: v for f, v in values.items() if f not in PSEUDO})
+    if "tension" in values:
+        well, gradient = interface_terms(model.interface_width, values["tension"])
+        model = model.replace(alpha=well.alpha, K=gradient.K)
+    if "activity" in values:
+        model = model.replace(
+            active_energy=values["activity"] * model.surface_tension * model.cell_radius
+        )
+    if "free_speed" in values:
+        model = model.replace(
+            active_energy=values["free_speed"] * model.cell_radius * model.effective_cell_friction
+        )
+    return model
 
 
 def parse_args():
@@ -150,7 +222,7 @@ def sweep_points(args):
     fields = [name.replace("-", "_") for name in args.over]
     axes = []
     for field, raw in zip(fields, args.values):
-        cast = argument_type(_FIELDS[field].default)
+        cast = float if field in PSEUDO else argument_type(_FIELDS[field].default)
         axis = []
         for value in raw:
             if cast is int and value != int(value):
@@ -169,7 +241,7 @@ def describe(fields, combination, seed=None) -> str:
 
 def run_point(base, fields, combination, seed, args, keep_fields):
     """Simulate one point, save it, and return the trajectory and its observables."""
-    model = base.replace(**dict(zip(fields, combination)))
+    model = apply_point(base, fields, combination)
     label = describe(fields, combination, seed)
     for note in model.concerns():
         print(f"  NOTE ({label}): {note}")
@@ -198,7 +270,7 @@ def load_point(base, fields, combination, seed, args):
     whole aggregation: aggregating while the array is still running is a normal
     thing to want.
     """
-    model = base.replace(**dict(zip(fields, combination)))
+    model = apply_point(base, fields, combination)
     path = Path(args.outdir) / (encode(model, args.duration, seed, args.warmup) + ".npz")
     if not path.exists():
         return None

@@ -160,7 +160,8 @@ def simulate(
 
     if warmup > 0:
         passive = ExplicitEuler(
-            dt=model.stepper(tissue, free_energy).dt, friction=model.friction, safety=1.0
+            dt=model.stepper(tissue, free_energy).dt, friction=model.friction, safety=1.0,
+            windowed=model.window,
         )
         passive.check(tissue, free_energy)
         run(tissue, free_energy, passive, max(1, round(warmup / passive.dt)), check=False)
@@ -182,8 +183,8 @@ def simulate(
     def capture(step: int) -> Snapshot:
         fields = tissue.fields
         # With model.window the per-cell measurements run on each cell's own patch of
-        # the grid; the windows are found afresh each snapshot since cells move.
-        windows = fields.windows() if model.window else None
+        # the grid; the windows are refreshed at each snapshot since cells move.
+        windows = fields.refresh_windows() if model.window else None
         cell_areas = areas(fields, windows)
         cell_perimeters = perimeters(fields, windows)
         contacts = overlap_matrix(fields)

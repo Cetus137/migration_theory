@@ -20,44 +20,44 @@
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 REPO=/users/kir-fritzsche/aif490/devel/migration_theory
-TAG=activity_adhesion_eps40_N100    # all outputs go to figures/${TAG}/, the figure as ${TAG}.png
+TAG=speed_friction_eps40_N100      # all outputs go to figures/${TAG}/, the figure as ${TAG}.png
 
 # the sweep
-OVER=active-energy                  # first swept parameter: the x axis of the figure
-VALUES=$(seq 0 15 | awk '{printf "%g ", $1 * 36 / 19}')   # 0 to 36 in 20 values; grid Peclet E_a/24 must stay below 2, so ~45 is the ceiling at dx = 1
-OVER2=adhesion                      # second swept parameter, one line per value; empty for a one-parameter sweep
-VALUES2=$(seq -s ' ' 0 0.06 0.54)   # 0 to 0.54 in 10 values; must stay below the ceiling, measured between 0.7 and 0.9 at these K and alpha
-SEEDS="0 1 2"                       # 20 x 10 x 3 = 600 tasks -> --array 0-599                     # 20 x 10 x 3 = 600 tasks -> --array 0-599
+OVER=free-speed                     # um/s of an unobstructed cell; the same on every friction line
+VALUES=$(seq -s ' ' 0 0.0125 0.2)  # 0 to 0.2 um/s in 17 values; at xi = 10 that is activity 0 to 8, threshold near 0.055
+OVER2=cell-friction                 # xi: at fixed speed the force E_a/R = v xi rises with it; one line per value
+VALUES2="3 10 30"                   # a decade of friction, so a decade of force at the same speed
+SEEDS="0 1"                         # 17 x 3 x 2 = 102 tasks -> --array 0-101
 
 # free energy (energy units are whatever alpha is quoted in; lengths in um)
-ALPHA=0.5                           # double-well depth; with K sets width sqrt(K/alpha) = 2 um
-K=2.0                               # gradient energy; with alpha sets tension sqrt(2 K alpha)/6
+ALPHA=0.5                           # double-well depth; with K sets width sqrt(K/alpha) = 2 um and tension 0.2357
+K=2.0                               # gradient energy; see ALPHA
 EPSILON=40                          # overlap repulsion; the model default 0.1 is too weak once active
-ADHESION=0.0                        # omega -- ignored here, it is swept
+ADHESION=0.0                        # omega
 AREA_LAMBDA=6000                    # area constraint; sets the timestep at these values
 
 # geometry
 CELL_RADIUS=12                      # um; target area pi R^2
 PACKING=1.0                         # total cell area / box area; 1 is confluent
-N_CELLS=75                         # box side scales as sqrt(N): 85 um at 16, 213 um at 100
+N_CELLS=100                         # box 213 um = 213^2 points; windows are a seventh of it
 SEEDING=tessellated                 # tessellated | circles
 
 # dynamics (time in seconds; time_unit is a label only)
 FRICTION=10                         # gamma: resists the field deforming
 PROPULSION=force                    # force | velocity
 SPEED=0.0                           # v0; velocity mode only
-ACTIVE_ENERGY=0                     # E_a; force mode only -- ignored here, it is swept
-CELL_FRICTION=10                    # xi: drag on a translating cell; force mode only
-ROTATIONAL_DIFFUSION=1e-3           # D_r; persistence time 1/D_r = 1000 s
+ACTIVE_ENERGY=0                     # E_a -- ignored here, set from the swept speed and friction as v R xi
+CELL_FRICTION=10                    # xi -- ignored here, it is swept
+ROTATIONAL_DIFFUSION=1e-3           # D_r; persistence time 1000 s
 TIME_UNIT=s
 
 # numerics
 GRID_SPACING=1.0                    # dx in um; pure resolution, appears in no physical quantity
 SAFETY=0.4                          # fraction of the stability limit the timestep takes
-WINDOW=""                           # "--window" measures each cell on its own patch of the grid; same numbers, stage 1 of windowed storage
+WINDOW="--window"                   # each cell on its own patch: same physics, ~6x faster at this size (measured 2026-09-21)
 
 # run
-DURATION=5000                       # physical time; 5 persistence times at D_r = 1e-3
+DURATION=5000                       # 5 persistence times
 WARMUP=25                           # passive relaxation before recording
 SNAPSHOTS=200                       # samples per run; sets the sampling interval of the analysis
 TRANSIENT=0.3                       # fraction of the run discarded before measuring; 0.3 covers the 720 s shape relaxation

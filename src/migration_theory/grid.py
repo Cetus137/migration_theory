@@ -135,25 +135,38 @@ class Grid:
         return d_dx + d_dy
 
     def centre_of_mass(self, field: np.ndarray) -> np.ndarray:
-        """Weighted centroid of each field, correct across the periodic boundary.
+        """Weighted centroid of each field, exact across the periodic boundary.
 
         A plain weighted mean is wrong for a blob straddling an edge -- it would place
-        the centre in the middle of the box. Averaging the angle each coordinate maps to
-        around its periodic circle, then mapping back, gives the right answer wherever
-        the blob sits.
+        the centre in the middle of the box. So: first a rough position from the
+        circular mean, averaging the angle each coordinate maps to around its periodic
+        circle; then the exact centroid as that position plus the weighted mean of
+        every point's *minimum-image* displacement from it. For a blob smaller than
+        half the box those displacements contain no wrap, so the second step is an
+        ordinary centroid and the result is exact.
+
+        The circular mean alone is not the centroid: its error is set by the blob's
+        third moment and, measured, reached 0.36 um for elongated cells in a fluid
+        tissue. The refinement removes it.
         """
         weights = np.asarray(field, dtype=float)
         total = np.sum(weights, axis=(-2, -1))
         X, Y = self.coordinates
 
-        centres = []
+        guess = []
         for coordinate, length in ((X, self.box.Lx), (Y, self.box.Ly)):
             angle = 2.0 * np.pi * coordinate / length
             mean_cos = np.sum(weights * np.cos(angle), axis=(-2, -1))
             mean_sin = np.sum(weights * np.sin(angle), axis=(-2, -1))
-            centres.append(np.mod(length * np.arctan2(mean_sin, mean_cos) / (2.0 * np.pi), length))
+            guess.append(length * np.arctan2(mean_sin, mean_cos) / (2.0 * np.pi))
 
-        centre = np.stack(centres, axis=-1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            centre = []
+            for coordinate, length, near in ((X, self.box.Lx, guess[0]), (Y, self.box.Ly, guess[1])):
+                offset = coordinate - near[..., None, None]
+                offset -= length * np.round(offset / length)          # minimum image
+                centre.append(near + np.sum(weights * offset, axis=(-2, -1)) / total)
+        centre = self.box.wrap(np.stack(centre, axis=-1))
         # A field that is identically zero has no centroid; report NaN rather than the
         # arbitrary answer arctan2(0, 0) would give.
         return np.where((total == 0)[..., None], np.nan, centre)

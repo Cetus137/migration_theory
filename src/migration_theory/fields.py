@@ -16,6 +16,7 @@ rather than touching ``.values`` directly, so that change stays local when you w
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 
@@ -75,19 +76,78 @@ class Windows:
         cols = (self.origins[:, 1, None] + np.arange(w)) % self.grid.nx
         return rows, cols
 
+    # Every transfer between windows and grid goes through one set of flattened grid
+    # indices, ``(n_cells, h * w)``, computed once per set of windows. With them a
+    # gather is a contiguous ``take_along_axis`` and an accumulation a ``bincount``,
+    # each a few nanoseconds per element. The three-array fancy indexing they replace
+    # cost about ten times that, and -- measured, stage 3 at 50 cells -- a per-cell
+    # loop of fancy-indexed adds was slower than the dense sum it was meant to beat.
+
+    @cached_property
+    def flat(self) -> np.ndarray:
+        """``(n_cells, h * w)`` index of every window point into the flattened grid."""
+        rows, cols = self.indices()
+        return (rows[:, :, None] * self.grid.nx + cols[:, None, :]).reshape(self.n_cells, -1)
+
+    def _stack(self, values: np.ndarray) -> np.ndarray:
+        return values.reshape(self.n_cells, -1)
+
+    def _patches(self, flat_values: np.ndarray) -> np.ndarray:
+        return flat_values.reshape(self.n_cells, *self.shape)
+
     def extract(self, values: np.ndarray) -> np.ndarray:
         """Every cell's window from a dense ``(n_cells, ny, nx)`` stack: ``(n_cells, h, w)``."""
-        rows, cols = self.indices()
-        cells = np.arange(self.n_cells)[:, None, None]
-        return values[cells, rows[:, :, None], cols[:, None, :]]
+        return self._patches(np.take_along_axis(self._stack(values), self.flat, axis=1))
+
+    def extract_field(self, field: np.ndarray) -> np.ndarray:
+        """Every cell's window of one shared ``(ny, nx)`` field: ``(n_cells, h, w)``.
+
+        For the quantities that couple cells -- the sum of squared fields the
+        repulsion needs, its Laplacian for adhesion -- which live on the grid once and
+        are read by every cell where it sits.
+        """
+        return self._patches(np.take(field.ravel(), self.flat))
+
+    def scatter(self, patches: np.ndarray, into: np.ndarray) -> np.ndarray:
+        """Write ``(n_cells, h, w)`` patches into a dense stack at the windows, in place.
+
+        Different cells' windows overlap on the grid but live in different slices of
+        the stack, so the assignment never collides with itself.
+        """
+        np.put_along_axis(self._stack(into), self.flat, self._stack(patches), axis=1)
+        return into
+
+    def add(self, patches: np.ndarray, into: np.ndarray) -> np.ndarray:
+        """Add ``(n_cells, h, w)`` patches into a dense stack at the windows, in place.
+
+        The update of a windowed step: the rate is known only on the windows and the
+        field outside them is left alone. Unique indices per cell, so gather, add and
+        put back is exact.
+        """
+        stack = self._stack(into)
+        current = np.take_along_axis(stack, self.flat, axis=1)
+        np.put_along_axis(stack, self.flat, current + self._stack(patches), axis=1)
+        return into
+
+    def accumulate(self, patches: np.ndarray, into: np.ndarray) -> np.ndarray:
+        """Sum ``(n_cells, h, w)`` patches into one shared ``(ny, nx)`` field, in place.
+
+        The way a grid-sized quantity that couples cells -- the sum of squared fields
+        the repulsion reads -- is built without touching the dense stack: each cell
+        contributes its patch where its window sits. Different cells' windows overlap
+        on the shared grid, so this is an accumulation, which ``bincount`` does in one
+        contiguous pass over the patch values with the flattened indices as bins.
+        """
+        into += np.bincount(
+            self.flat.ravel(), weights=patches.ravel(), minlength=self.grid.n_points
+        ).reshape(self.grid.shape)
+        return into
 
     def mask(self) -> np.ndarray:
         """``(n_cells, ny, nx)`` booleans, ``True`` inside each cell's window."""
-        rows, cols = self.indices()
-        inside = np.zeros((self.n_cells, self.grid.ny, self.grid.nx), dtype=bool)
-        cells = np.arange(self.n_cells)[:, None, None]
-        inside[cells, rows[:, :, None], cols[:, None, :]] = True
-        return inside
+        inside = np.zeros((self.n_cells, self.grid.n_points), dtype=bool)
+        np.put_along_axis(inside, self.flat, True, axis=1)
+        return inside.reshape(self.n_cells, self.grid.ny, self.grid.nx)
 
     def coordinates(self) -> tuple[np.ndarray, np.ndarray]:
         """``(X, Y)``, each ``(n_cells, h, w)``: positions of the window points.
@@ -101,6 +161,46 @@ class Windows:
         y = (self.origins[:, 0, None] + np.arange(h)) * self.grid.dy
         target = (self.n_cells, h, w)
         return np.broadcast_to(x[:, None, :], target), np.broadcast_to(y[:, :, None], target)
+
+    # ------------------------------------------------------------- stencils on patches
+    #
+    # The same operators the grid provides, on a stack of windows ``(n_cells, h, w)``.
+    # A window has no periodic wrap inside it, so a stencil needs a border: zero, since
+    # the field beyond a window is below the window threshold by construction -- or
+    # wrapped, on an axis the window spans entirely, where it is the periodic grid
+    # itself and must give the dense result exactly. Every windowed derivative of the
+    # free energy is built from these three.
+
+    def pad(self, patches: np.ndarray) -> np.ndarray:
+        """Patches with a one-point border: ``(n_cells, h + 2, w + 2)``."""
+        rows = "wrap" if self.spans_rows else "constant"
+        cols = "wrap" if self.spans_cols else "constant"
+        padded = np.pad(patches, ((0, 0), (1, 1), (0, 0)), mode=rows)
+        return np.pad(padded, ((0, 0), (0, 0), (1, 1)), mode=cols)
+
+    def gradient(self, patches: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(d/dx, d/dy)`` by second-order central differences, as :meth:`Grid.gradient`."""
+        p = self.pad(patches)
+        d_dx = (p[:, 1:-1, 2:] - p[:, 1:-1, :-2]) / (2.0 * self.grid.dx)
+        d_dy = (p[:, 2:, 1:-1] - p[:, :-2, 1:-1]) / (2.0 * self.grid.dy)
+        return d_dx, d_dy
+
+    def forward_gradient(self, patches: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """First differences to the next point, as :meth:`Grid.forward_gradient` --
+        the pair that is the exact adjoint of :meth:`laplacian`."""
+        p = self.pad(patches)
+        centre = p[:, 1:-1, 1:-1]
+        d_dx = (p[:, 1:-1, 2:] - centre) / self.grid.dx
+        d_dy = (p[:, 2:, 1:-1] - centre) / self.grid.dy
+        return d_dx, d_dy
+
+    def laplacian(self, patches: np.ndarray) -> np.ndarray:
+        """Five-point Laplacian, as :meth:`Grid.laplacian`."""
+        p = self.pad(patches)
+        centre = p[:, 1:-1, 1:-1]
+        d2_dx2 = (p[:, 1:-1, 2:] + p[:, 1:-1, :-2] - 2.0 * centre) / self.grid.dx**2
+        d2_dy2 = (p[:, 2:, 1:-1] + p[:, :-2, 1:-1] - 2.0 * centre) / self.grid.dy**2
+        return d2_dx2 + d2_dy2
 
 
 def _circular_spans(occupied: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -134,6 +234,13 @@ class PhaseFields:
     grid: Grid
     values: np.ndarray
     """``(n_cells, ny, nx)``. Prefer the methods below; this is the dense backing store."""
+
+    windows: Windows | None = None
+    """Where each cell currently is, when the dynamics run on windows; ``None`` otherwise.
+
+    Part of the state because it goes stale as cells move: :meth:`refresh_windows`
+    recomputes it, and the stepper calls that every so many steps.
+    """
 
     def __post_init__(self) -> None:
         self.values = np.asarray(self.values, dtype=float)
@@ -173,7 +280,7 @@ class PhaseFields:
     def laplacian(self) -> np.ndarray:
         return self.grid.laplacian(self.values)
 
-    def windows(self, margin: int = 3, threshold: float = 1e-6) -> Windows:
+    def find_windows(self, margin: int = 3, threshold: float = 1e-6) -> Windows:
         """The patch of the grid each cell occupies, with ``margin`` points to spare.
 
         Found from the fields themselves: the rows and columns where a cell exceeds
@@ -207,8 +314,21 @@ class PhaseFields:
         ])
         return Windows(self.grid, (h, w), origins)
 
+    def refresh_windows(self, margin: int = 3, threshold: float = 1e-6) -> Windows:
+        """Recompute :attr:`windows` from the fields and zero everything outside them.
+
+        The zeroing is what keeps a windowed run honest. Between refreshes the field
+        outside a window is never updated, so as a cell moves on it would leave behind
+        a frozen tail -- below the threshold, but litter all the same, and litter that
+        the next refresh would count as part of the cell. Clearing it makes "outside
+        the window" mean exactly zero, and costs one pass over the stack.
+        """
+        self.windows = self.find_windows(margin, threshold)
+        self.values[~self.windows.mask()] = 0.0
+        return self.windows
+
     def copy(self) -> PhaseFields:
-        return PhaseFields(self.grid, self.values.copy())
+        return PhaseFields(self.grid, self.values.copy(), self.windows)
 
 
 def seed(

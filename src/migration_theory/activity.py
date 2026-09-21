@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .fields import PhaseFields
+from .fields import PhaseFields, Windows
 
 __all__ = ["Polarity", "advection", "passive_forces", "ImposedVelocity", "ForceBalance"]
 
@@ -93,8 +93,25 @@ class Polarity:
 Gradient = tuple[np.ndarray, np.ndarray]
 
 
+def field_gradient(
+    fields: PhaseFields, windows: Windows | None = None, patches: np.ndarray | None = None
+) -> Gradient:
+    """The central gradient of every cell's field: dense, or on windows.
+
+    ``patches`` is the windows' contents if the caller has gathered them already.
+    """
+    if windows is None:
+        return fields.gradient()
+    if patches is None:
+        patches = windows.extract(fields.values)
+    return windows.gradient(patches)
+
+
 def advection(
-    fields: PhaseFields, velocities: np.ndarray, gradient: Gradient | None = None
+    fields: PhaseFields,
+    velocities: np.ndarray,
+    gradient: Gradient | None = None,
+    windows: Windows | None = None,
 ) -> np.ndarray:
     r"""``-v_i . grad(phi_i)``, the contribution of self-propulsion to ``d(phi_i)/dt``.
 
@@ -103,23 +120,26 @@ def advection(
     non-variational -- it does not come from any free energy -- which is exactly what
     makes the tissue active.
 
-    ``gradient`` is the central-difference ``fields.gradient()``, if the caller already
-    has it: under force balance the same gradient enters :func:`passive_forces`, and
-    the stepper computes it once for both.
-
-    Returns ``(n_cells, ny, nx)``.
+    ``gradient`` is the central-difference gradient of the fields, if the caller
+    already has it: under force balance the same gradient enters
+    :func:`passive_forces`, and the stepper computes it once for both. With
+    ``windows`` everything is on each cell's patch and the result is ``(n_cells, h, w)``;
+    otherwise ``(n_cells, ny, nx)``.
     """
     velocities = np.atleast_2d(np.asarray(velocities, dtype=float))
     if velocities.shape != (fields.n_cells, 2):
         raise ValueError(
             f"velocities must have shape ({fields.n_cells}, 2), got {velocities.shape}"
         )
-    d_dx, d_dy = fields.gradient() if gradient is None else gradient
+    d_dx, d_dy = field_gradient(fields, windows) if gradient is None else gradient
     return -(velocities[:, 0, None, None] * d_dx + velocities[:, 1, None, None] * d_dy)
 
 
 def passive_forces(
-    fields: PhaseFields, mu: np.ndarray, gradient: Gradient | None = None
+    fields: PhaseFields,
+    mu: np.ndarray,
+    gradient: Gradient | None = None,
+    windows: Windows | None = None,
 ) -> np.ndarray:
     r"""``(n_cells, 2)`` mechanical force on each cell from the free energy.
 
@@ -131,16 +151,22 @@ def passive_forces(
 
     ``mu`` is passed in rather than recomputed because the stepper already has it --
     the same array drives both the relaxation and the motion. ``gradient`` likewise,
-    when the caller has ``fields.gradient()`` already.
+    when the caller has it already. With ``windows``, ``mu`` and ``gradient`` are
+    patches and the integral is a window sum.
 
     Because the free energy cannot change when every cell is translated together, these
     forces sum to zero: a cell pushed by a neighbour pushes back just as hard. That is
     what makes a blocked cell stall instead of ploughing on, and it is worth checking
     numerically rather than assuming -- see the tests.
     """
-    d_dx, d_dy = fields.gradient() if gradient is None else gradient
+    d_dx, d_dy = field_gradient(fields, windows) if gradient is None else gradient
+    if windows is None:
+        return np.column_stack(
+            [fields.grid.integrate(mu * d_dx), fields.grid.integrate(mu * d_dy)]
+        )
+    area = fields.grid.cell_area
     return np.column_stack(
-        [fields.grid.integrate(mu * d_dx), fields.grid.integrate(mu * d_dy)]
+        [(mu * d_dx).sum(axis=(-2, -1)) * area, (mu * d_dy).sum(axis=(-2, -1)) * area]
     )
 
 
@@ -153,7 +179,8 @@ class ImposedVelocity:
     neighbours rather than stalling. Kept for comparison against :class:`ForceBalance`.
     """
 
-    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None) -> np.ndarray:
+    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None,
+                   windows: Windows | None = None) -> np.ndarray:
         return tissue.polarity.velocities
 
 
@@ -194,6 +221,8 @@ class ForceBalance:
         """``E_a / (R xi)``: the speed of a cell with nothing in its way."""
         return self.active_energy / (self.cell_radius * self.cell_friction)
 
-    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None) -> np.ndarray:
+    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None,
+                   windows: Windows | None = None) -> np.ndarray:
         active = (self.active_energy / self.cell_radius) * tissue.polarity.directors
-        return (active + passive_forces(tissue.fields, mu, gradient)) / self.cell_friction
+        passive = passive_forces(tissue.fields, mu, gradient, windows)
+        return (active + passive) / self.cell_friction
