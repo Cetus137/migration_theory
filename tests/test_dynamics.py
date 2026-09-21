@@ -29,10 +29,15 @@ def test_energy_falls_at_the_rate_the_equation_says(model):
 
     Ties the stepper to the free energy quantitatively rather than just checking the
     sign -- it would catch a wrong friction, a wrong sign, or a missing factor.
+
+    The identity is exact as dt -> 0. Forward Euler at a finite step falls short by a
+    second-order term -- measured, 23% at 40% of the stability limit, 0.05% at 0.1%
+    -- so the step here is a thousandth of the limit.
     """
     tissue = model.tissue(seed=0)
     energy = model.free_energy()
-    stepper = model.stepper(tissue, energy)
+    stepper = ExplicitEuler(dt=1e-3 * model.max_stable_dt(tissue, energy),
+                            friction=model.friction, safety=1.0)
 
     derivative = energy.functional_derivative(tissue.fields)
     predicted = -tissue.grid.integrate((derivative**2).sum(axis=0)) / model.friction

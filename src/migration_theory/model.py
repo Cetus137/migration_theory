@@ -503,9 +503,10 @@ class Model:
         notes = []
         if self.adhesion >= self.adhesion_ceiling:
             notes.append(
-                f"adhesion {self.adhesion:g} is at or above K = {self.adhesion_ceiling:g}; "
-                "the gradient Hessian is no longer positive definite, so the energy is "
-                "unbounded below and the run will diverge rather than relax."
+                f"adhesion {self.adhesion:g} is at or above the ceiling K = "
+                f"{self.adhesion_ceiling:g}; the gradient Hessian is no longer positive "
+                "definite, so the energy is unbounded below and the run will diverge "
+                "rather than relax."
             )
         elif self.adhesion > 0.7 * self.adhesion_ceiling:
             notes.append(

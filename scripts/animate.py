@@ -11,8 +11,8 @@ Usage::
     python scripts/animate.py --no-video --analyse              # numbers only, much faster
     python scripts/animate.py --K 1 --adhesion 0.5 --energy
 
-Every run writes ``figures/<name>.npz`` holding the parameters and every per-snapshot
-measurement, readable later with
+Every run writes ``<outdir>/<name>.npz`` holding the parameters and every per-snapshot
+measurement, with the video and figures beside it, readable later with
 :func:`~migration_theory.simulate.load_trajectory` -- so the analysis can be redone, or
 redone differently, without paying for the simulation again. The name encodes every
 parameter, so a directory listing is self-describing.
@@ -61,6 +61,8 @@ def parse_args():
     output.add_argument("--frames", type=int, default=200)
     output.add_argument("--fps", type=int, default=20)
     output.add_argument("--format", choices=("gif", "mp4"), default="mp4")
+    output.add_argument("--dpi", type=float, default=80.0,
+                        help="frame resolution; sets a gif's file size almost directly")
     output.add_argument("--vmin", type=float, default=None, help="colour-scale floor")
     output.add_argument("--vmax", type=float, default=None, help="colour-scale ceiling")
     output.add_argument("--name", default=None, help="override the generated filename")
@@ -83,7 +85,7 @@ def main() -> None:
         print(f"  run covers {turns:.2f} persistence times"
               + ("" if turns >= 3 else "   <- too short for migration statistics"))
 
-    name = args.name or encode(model, args.duration, args.seed)
+    name = args.name or encode(model, args.duration, args.seed, args.warmup)
     print(f"\nrunning -> {name}")
 
     def progress(done, total, snapshot):
@@ -104,12 +106,13 @@ def main() -> None:
         import plotstyle
         import render
 
+        outdir = Path(args.outdir)
         if not args.no_video:
             animation = render.make_animation(trajectory, fps=args.fps,
                                               vmin=args.vmin, vmax=args.vmax)
-            print(f"  wrote {render.save_animation(animation, name, fps=args.fps, prefer=args.format)}")
+            print(f"  wrote {render.save_animation(animation, name, fps=args.fps, prefer=args.format, directory=outdir, dpi=args.dpi)}")
         if args.energy:
-            print(f"  wrote {plotstyle.save(render.energy_figure(trajectory), name + '_energy')}")
+            print(f"  wrote {plotstyle.save(render.energy_figure(trajectory), name + '_energy', outdir)}")
 
     if args.analyse:
         print("\ntissue state:")

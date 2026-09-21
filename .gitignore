@@ -9,6 +9,9 @@ figures/
 *.mp4
 *.webm
 
+# SLURM job logs
+SLURM/slogs/
+
 # Python
 __pycache__/
 *.py[cod]

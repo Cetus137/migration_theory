@@ -90,13 +90,22 @@ class Polarity:
         return Polarity(self.angles.copy(), self.speed, self.rotational_diffusion, self.rng)
 
 
-def advection(fields: PhaseFields, velocities: np.ndarray) -> np.ndarray:
+Gradient = tuple[np.ndarray, np.ndarray]
+
+
+def advection(
+    fields: PhaseFields, velocities: np.ndarray, gradient: Gradient | None = None
+) -> np.ndarray:
     r"""``-v_i . grad(phi_i)``, the contribution of self-propulsion to ``d(phi_i)/dt``.
 
     Translating a field rigidly at velocity ``v`` means ``d(phi)/dt = -v . grad(phi)``,
     so this term is what makes a cell move rather than merely change shape. It is
     non-variational -- it does not come from any free energy -- which is exactly what
     makes the tissue active.
+
+    ``gradient`` is the central-difference ``fields.gradient()``, if the caller already
+    has it: under force balance the same gradient enters :func:`passive_forces`, and
+    the stepper computes it once for both.
 
     Returns ``(n_cells, ny, nx)``.
     """
@@ -105,11 +114,13 @@ def advection(fields: PhaseFields, velocities: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"velocities must have shape ({fields.n_cells}, 2), got {velocities.shape}"
         )
-    d_dx, d_dy = fields.gradient()
+    d_dx, d_dy = fields.gradient() if gradient is None else gradient
     return -(velocities[:, 0, None, None] * d_dx + velocities[:, 1, None, None] * d_dy)
 
 
-def passive_forces(fields: PhaseFields, mu: np.ndarray) -> np.ndarray:
+def passive_forces(
+    fields: PhaseFields, mu: np.ndarray, gradient: Gradient | None = None
+) -> np.ndarray:
     r"""``(n_cells, 2)`` mechanical force on each cell from the free energy.
 
     .. math:: \mathbf{F}_i = \int \mu_i \nabla\phi_i \, \mathrm{d}x,
@@ -119,14 +130,15 @@ def passive_forces(fields: PhaseFields, mu: np.ndarray) -> np.ndarray:
     the energy changes by ``-u . INT mu_i grad(phi_i)`` and the force is that integral.
 
     ``mu`` is passed in rather than recomputed because the stepper already has it --
-    the same array drives both the relaxation and the motion.
+    the same array drives both the relaxation and the motion. ``gradient`` likewise,
+    when the caller has ``fields.gradient()`` already.
 
     Because the free energy cannot change when every cell is translated together, these
     forces sum to zero: a cell pushed by a neighbour pushes back just as hard. That is
     what makes a blocked cell stall instead of ploughing on, and it is worth checking
     numerically rather than assuming -- see the tests.
     """
-    d_dx, d_dy = fields.grid.gradient(fields.values)
+    d_dx, d_dy = fields.gradient() if gradient is None else gradient
     return np.column_stack(
         [fields.grid.integrate(mu * d_dx), fields.grid.integrate(mu * d_dy)]
     )
@@ -141,7 +153,7 @@ class ImposedVelocity:
     neighbours rather than stalling. Kept for comparison against :class:`ForceBalance`.
     """
 
-    def velocities(self, tissue, mu: np.ndarray) -> np.ndarray:
+    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None) -> np.ndarray:
         return tissue.polarity.velocities
 
 
@@ -182,6 +194,6 @@ class ForceBalance:
         """``E_a / (R xi)``: the speed of a cell with nothing in its way."""
         return self.active_energy / (self.cell_radius * self.cell_friction)
 
-    def velocities(self, tissue, mu: np.ndarray) -> np.ndarray:
+    def velocities(self, tissue, mu: np.ndarray, gradient: Gradient | None = None) -> np.ndarray:
         active = (self.active_energy / self.cell_radius) * tissue.polarity.directors
-        return (active + passive_forces(tissue.fields, mu)) / self.cell_friction
+        return (active + passive_forces(tissue.fields, mu, gradient)) / self.cell_friction

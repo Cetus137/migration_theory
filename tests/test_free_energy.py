@@ -67,12 +67,43 @@ def test_gradient_energy_is_zero_for_a_uniform_field(fields):
 
 
 def test_repulsion_equals_the_sum_over_pairs(fields):
+    """The linear-time identity against the literal double sum it replaces."""
     term = Repulsion(epsilon=2.5)
     literal = sum(
         fields.grid.integrate(fields[i] ** 2 * fields[j] ** 2)
         for i, j in combinations(range(fields.n_cells), 2)
     )
     assert term.energy(fields) == pytest.approx(2.5 * literal, rel=1e-12)
+
+
+def test_repulsion_density_equals_the_sum_over_pairs_pointwise(fields):
+    """Not just the integral: the identity must hold at every grid point."""
+    term = Repulsion(epsilon=2.5)
+    literal = np.zeros(fields.grid.shape)
+    for i, j in combinations(range(fields.n_cells), 2):
+        literal += fields[i] ** 2 * fields[j] ** 2
+    assert term.density(fields) == pytest.approx(2.5 * literal, rel=1e-12, abs=1e-15)
+
+
+def test_repulsion_derivative_equals_the_literal_loop(fields):
+    """``2 eps phi_k sum_{j != k} phi_j^2``, written out as the loop it used to be."""
+    term = Repulsion(epsilon=2.5)
+    literal = np.zeros_like(fields.values)
+    for k in range(fields.n_cells):
+        others = np.zeros(fields.grid.shape)
+        for j in range(fields.n_cells):
+            if j != k:
+                others += fields[j] ** 2
+        literal[k] = 2.0 * 2.5 * fields[k] * others
+    assert term.functional_derivative(fields) == pytest.approx(literal, rel=1e-12, abs=1e-15)
+
+
+def test_adhesion_is_exactly_zero_without_adhesion(fields):
+    """The omega = 0 shortcut must give what the full computation gives: nothing."""
+    term = Adhesion(omega=0.0)
+    assert term.energy(fields) == 0.0
+    assert np.all(term.density(fields) == 0.0)
+    assert np.all(term.functional_derivative(fields) == 0.0)
 
 
 def test_adhesion_equals_the_sum_over_pairs(fields):

@@ -216,14 +216,28 @@ class Repulsion:
     ``2 eps phi_i phi_j^2`` and as ``2 eps phi_j phi_i^2`` -- which is what makes the
     two cells separate rather than one simply fleeing the other.
 
-    Written here as the literal double sum. That is O(N^2) grid operations, which is
-    fine at present sizes and has the advantage of being readable straight off the
-    formula. If the cell count grows enough to matter, both quantities can be had in
-    O(N) from ``sum_{i<j} a_i a_j = [(sum_i a_i)^2 - sum_i a_i^2] / 2`` with
-    ``a_i = phi_i^2``; swap it in then, and test it against this version.
-
     Each unordered pair is counted once. Summing over ordered pairs would just double
     ``epsilon``.
+
+    **Computed in linear time, not as the double sum.** Written literally, the sum over
+    pairs is ``N(N-1)/2`` grid operations -- 120 at 16 cells, 4950 at 100 -- and it
+    would dominate everything else once the tissue is large. It is not necessary. At
+    each grid point write ``a_i = phi_i^2``; then squaring the plain sum gives every
+    product twice plus the squares once,
+
+        (a_1 + a_2 + ... + a_N)^2 = sum_i a_i^2 + 2 sum_{i<j} a_i a_j
+
+    so the pair sum is recovered from two sums that each cost one pass over the cells:
+
+        sum_{i<j} a_i a_j = [ (sum_i a_i)^2 - sum_i a_i^2 ] / 2
+
+    With three cells and ``a = (1, 2, 3)``: the pairs give ``1*2 + 1*3 + 2*3 = 11``, and
+    ``(6^2 - 14) / 2 = 11``. The derivative for cell ``k`` needs ``sum_{j != k} phi_j^2``,
+    which is the same total with cell ``k``'s own term taken back out,
+    ``S - phi_k^2`` with ``S = sum_j phi_j^2``, again computed once for all cells.
+
+    Both identities are exact algebra, not approximations; the tests hold this
+    version against the literal pair loop to machine precision.
     """
 
     epsilon: float = 1.0
@@ -233,26 +247,17 @@ class Repulsion:
             raise ValueError(f"epsilon must be non-negative, got {self.epsilon}")
 
     def density(self, fields: PhaseFields) -> np.ndarray:
-        squared = fields.values**2
-        total = np.zeros(fields.grid.shape)
-        for i in range(fields.n_cells):
-            for j in range(i + 1, fields.n_cells):
-                total += squared[i] * squared[j]
-        return self.epsilon * total
+        squared = fields.values**2                        # a_i = phi_i^2, per cell
+        total = squared.sum(axis=0)                       # sum_i a_i, one pass over cells
+        return 0.5 * self.epsilon * (total**2 - (squared**2).sum(axis=0))
 
     def energy(self, fields: PhaseFields) -> float:
         return float(fields.grid.integrate(self.density(fields)))
 
     def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
         squared = fields.values**2
-        derivative = np.zeros_like(fields.values)
-        for k in range(fields.n_cells):
-            others = np.zeros(fields.grid.shape)
-            for j in range(fields.n_cells):
-                if j != k:
-                    others += squared[j]
-            derivative[k] = 2.0 * self.epsilon * fields.values[k] * others
-        return derivative
+        others = squared.sum(axis=0) - squared            # sum_{j != k} phi_j^2 for every k
+        return 2.0 * self.epsilon * fields.values * others
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma / (eps max_k sum_{j!=k} phi_j^2)``.
@@ -325,16 +330,26 @@ class Adhesion:
         if self.omega < 0:
             raise ValueError(f"omega must be non-negative, got {self.omega}")
 
+    # With omega = 0 the term is identically zero, so the gradients and Laplacians
+    # below would be computed only to be multiplied by nothing. Skipping them saves a
+    # noticeable slice of every step in the common no-adhesion case.
+
     def density(self, fields: PhaseFields) -> np.ndarray:
+        if self.omega == 0:
+            return np.zeros(fields.grid.shape)
         d_dx, d_dy = fields.grid.forward_gradient(fields.values**2)
         total = d_dx.sum(axis=0) ** 2 + d_dy.sum(axis=0) ** 2
         own = (d_dx**2 + d_dy**2).sum(axis=0)
         return 0.5 * self.omega * (total - own)
 
     def energy(self, fields: PhaseFields) -> float:
+        if self.omega == 0:
+            return 0.0
         return float(fields.grid.integrate(self.density(fields)))
 
     def functional_derivative(self, fields: PhaseFields) -> np.ndarray:
+        if self.omega == 0:
+            return np.zeros_like(fields.values)
         laplacian = fields.grid.laplacian(fields.values**2)
         return -2.0 * self.omega * fields.values * (laplacian.sum(axis=0) - laplacian)
 

@@ -22,6 +22,9 @@ from .analysis import (
     shape_statistics,
     tissue_state,
     tracks,
+    velocities,
+    velocity_correlation,
+    velocity_correlations,
 )
 from .box import PeriodicBox
 from .dynamics import Diverged, ExplicitEuler, UnstableTimestep, run
@@ -120,4 +123,7 @@ __all__ = [
     "seed",
     "seed_tessellated",
     "triangular_lattice",
+    "velocities",
+    "velocity_correlation",
+    "velocity_correlations",
 ]

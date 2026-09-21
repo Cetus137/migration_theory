@@ -233,6 +233,9 @@ def simulate(
         max_dt=max_dt,
         steps=steps,
         wall_seconds=time.perf_counter() - started,
+        # The run arguments that are not Model fields but change the result. Saved
+        # with the trajectory so a file on disk is fully reproducible from itself.
+        extras={"warmup": float(warmup), "seed": int(seed)},
     )
 
 
@@ -277,6 +280,7 @@ def save_trajectory(trajectory: Trajectory, path: str | Path) -> Path:
         "max_dt": trajectory.max_dt,
         "steps": trajectory.steps,
         "wall_seconds": trajectory.wall_seconds,
+        "extras": trajectory.extras,
     }
     np.savez_compressed(path, meta=json.dumps(meta), **arrays)
     return path
@@ -322,4 +326,5 @@ def load_trajectory(path: str | Path) -> Trajectory:
         max_dt=meta["max_dt"],
         steps=meta["steps"],
         wall_seconds=meta["wall_seconds"],
+        extras=meta.get("extras", {}),  # absent from files written before it was saved
     )

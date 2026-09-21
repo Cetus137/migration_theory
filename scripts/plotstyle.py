@@ -120,9 +120,14 @@ def field_axes(ax, grid, title=None):
     return ax
 
 
-def save(fig, name: str) -> Path:
-    """Write a figure into ``figures/``, creating it if needed."""
-    FIGURES.mkdir(exist_ok=True)
-    path = FIGURES / (name if name.endswith(".png") else f"{name}.png")
+def save(fig, name: str, directory: Path | str | None = None) -> Path:
+    """Write a figure as PNG into ``directory``, creating it if needed.
+
+    Defaults to the repository's ``figures/``. A script that keeps a run's ``.npz``
+    somewhere else passes that directory, so every output of a run sits together.
+    """
+    directory = FIGURES if directory is None else Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / (name if name.endswith(".png") else f"{name}.png")
     fig.savefig(path)
     return path

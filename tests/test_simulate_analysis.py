@@ -7,6 +7,8 @@ import pytest
 
 from migration_theory import (
     Model,
+    Snapshot,
+    Trajectory,
     diffusion_coefficient,
     load_trajectory,
     mean_squared_displacement,
@@ -17,6 +19,8 @@ from migration_theory import (
     shape_statistics,
     simulate,
     tissue_state,
+    velocities,
+    velocity_correlation,
 )
 
 
@@ -59,18 +63,18 @@ def test_keep_fields_controls_the_image_data(model):
 
 
 def test_warmup_resets_the_clock_and_relaxes_first(model):
-    """The seeded state overlaps heavily; warmup is how an active run avoids starting
-    inside that transient."""
-    from migration_theory import overlap_matrix
+    """Warm-up runs the passive relaxation before the clock starts, so the recorded run
+    opens from a relaxed state rather than the seeded one.
 
+    Judged by the energy, not the overlap: with tessellated seeding the cold start
+    overlaps *little* and relaxing raises the overlap, because in this small model the
+    area constraint has to expand the cells into each other to reach their target.
+    """
     warmed = simulate(model, duration=50, warmup=400, n_snapshots=3, keep_fields=False)
     cold = simulate(model, duration=50, n_snapshots=3, keep_fields=False)
     assert warmed.snapshots[0].time == pytest.approx(0.0)
-
-    def overlap(snapshot):
-        return np.triu(snapshot.contacts, 1).sum()
-
-    assert overlap(warmed.snapshots[0]) < overlap(cold.snapshots[0])
+    assert warmed.snapshots[0].step == 0
+    assert warmed.snapshots[0].energy < 0.1 * cold.snapshots[0].energy
 
 
 # ----------------------------------------------------------------- storage
@@ -116,11 +120,17 @@ def test_msd_is_quadratic_for_straight_line_motion():
 
 
 def test_persistent_random_walk_recovers_what_went_in():
-    """Fit the measured motion of free cells; it must return the imposed parameters."""
-    free = Model(n_cells=4, cell_radius=5.0, packing=0.25,
+    """Fit the measured motion of free cells; it must return the imposed parameters.
+
+    Eight cells rather than four, for the statistics at lags near the persistence
+    time; a soft area constraint only to loosen the timestep, since free cells do not
+    care about it.
+    """
+    free = Model(n_cells=8, cell_radius=5.0, packing=0.25, area_lambda=600.0,
                  speed=0.05, rotational_diffusion=0.02)
     trajectory = simulate(free, duration=1500, n_snapshots=120, keep_fields=False)
     fit = persistent_random_walk(trajectory)
+    assert fit["persistence_fit_at_bound"] == 0.0
     assert fit["measured_speed"] == pytest.approx(free.speed, rel=0.4)
     assert fit["measured_persistence_time"] == pytest.approx(free.persistence_time, rel=0.6)
     assert 0.3 < fit["speed_ratio"] < 2.5
@@ -161,5 +171,68 @@ def test_tissue_state_returns_finite_numbers(model):
                           n_snapshots=40, keep_fields=False)
     state = tissue_state(trajectory)
     assert set(state) >= {"shape_index_mean", "diffusion_coefficient", "msd_exponent",
-                          "measured_speed", "exchange_rate_per_cell", "occupancy"}
+                          "measured_speed", "exchange_rate_per_cell", "occupancy",
+                          "velocity_correlation_length", "neighbour_velocity_correlation"}
     assert all(np.isfinite(v) for v in state.values())
+
+
+# ----------------------------------------------------------------- velocity correlation
+
+
+def _walk(model, velocity_of, n_frames=80, interval=10.0, seed=0):
+    """A synthetic trajectory whose cells move at ``velocity_of(positions, rng)``.
+
+    Only the centres matter to the velocity analysis; everything else is filled with
+    placeholders so a :class:`Snapshot` can be built without simulating.
+    """
+    rng = np.random.default_rng(seed)
+    box = model.box
+    n = model.n_cells
+    centres = rng.uniform(0.0, 1.0, (n, 2)) * box.lengths
+    snapshots = []
+    for frame in range(n_frames):
+        snapshots.append(Snapshot(
+            step=frame, time=frame * interval, energy=0.0, breakdown={},
+            area_ratio=1.0, shape_index=3.8, confluence=0.0, occupancy=1.0,
+            centres=centres.copy(), areas=np.ones(n), perimeters=np.ones(n),
+            contacts=np.zeros((n, n)),
+        ))
+        centres = box.wrap(centres + interval * velocity_of(centres, rng))
+    return Trajectory(model=model, snapshots=snapshots, tissue=None, dt=interval,
+                      max_dt=interval, steps=n_frames, wall_seconds=0.0)
+
+
+def test_velocities_have_no_net_drift():
+    """The tissue's own motion is subtracted, whatever it is."""
+    model = Model(n_cells=16)
+    drifting = _walk(model, lambda x, rng: np.tile(rng.normal(0, 0.1, 2), (len(x), 1)))
+    _, velocity, _ = velocities(drifting, transient=0.0)
+    assert np.abs(velocity).max() < 1e-9
+
+
+def test_velocity_correlation_starts_at_one_and_is_short_for_independent_cells():
+    model = Model(n_cells=16)
+    independent = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape))
+    curve = velocity_correlation(independent, transient=0.0)
+    assert curve["correlation"][0] == 1.0
+    assert np.all(np.diff(curve["separation"]) > 0)
+    # Independent cells are uncorrelated at every separation, so the drop to 1/e
+    # happens before the first populated bin.
+    assert curve["correlation_length"] < curve["separation"][1]
+    assert not curve["censored"]
+
+
+def test_velocity_correlation_length_grows_with_a_long_wavelength_mode():
+    """Cells moving with a smooth field are correlated over its wavelength."""
+    model = Model(n_cells=16)
+    L = model.box.lengths
+
+    def wave(x, rng):
+        amplitude = rng.normal(0, 0.1, 2)
+        phase = 2 * np.pi * x / L
+        return amplitude * np.column_stack([np.sin(phase[:, 0]), np.sin(phase[:, 1])])
+
+    collective = _walk(model, wave)
+    independent = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape))
+    assert (velocity_correlation(collective, transient=0.0)["correlation_length"]
+            > velocity_correlation(independent, transient=0.0)["correlation_length"])

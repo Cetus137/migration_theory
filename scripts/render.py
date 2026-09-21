@@ -202,23 +202,48 @@ def make_animation(trajectory, fps=20, transient=0.2, vmin=None, vmax=None):
                                    interval=1000 / fps, blit=False)
 
 
-def observables_figure(values, states, label, reported):
+def observables_figure(series, label, reported):
     """Each observable against the swept parameter, one small panel apiece.
 
     Small multiples rather than shared axes: the quantities differ by orders of
     magnitude -- a T1 rate near zero beside a shape index near 4 -- and forcing them
     onto one pair of axes would flatten whichever is smaller into the baseline.
+
+    ``series`` is a list of dicts, one line per entry, each with ``values`` (the x
+    axis), ``states`` (one observables dict per value), an optional ``spreads`` (one
+    dict per value, drawn as error bars -- the standard deviation over seeds) and an
+    optional ``name`` for the legend. A one-parameter sweep is a single unnamed entry;
+    a two-parameter grid is one entry per value of the second parameter, so that
+    parameter is carried by colour and the first by the x axis.
     """
     plotstyle.use_style()
     columns = 4
     rows = int(np.ceil(len(reported) / columns))
     fig, axes = plt.subplots(rows, columns, figsize=(3.2 * columns, 2.7 * rows),
                              squeeze=False)
+    single = len(series) == 1
+    # One series takes a categorical colour per panel. Several series are ordered
+    # values of a second parameter, so they take a sequential ramp: light for the
+    # smallest, dark for the largest, and the order is legible however many there are.
+    ramp = plotstyle.FIELD_CMAP(np.linspace(0.3, 1.0, max(len(series), 2)))
 
     for index, (key, title) in enumerate(reported):
         ax = axes[index // columns][index % columns]
-        series = [state[key] for state in states]
-        ax.plot(values, series, "o-", color=plotstyle.SERIES[index % 4], ms=5)
+        for order, entry in enumerate(series):
+            colour = (plotstyle.SERIES[index % len(plotstyle.SERIES)] if single
+                      else ramp[order])
+            values = entry["values"]
+            heights = [state[key] for state in entry["states"]]
+            if entry.get("spreads") is None:
+                ax.plot(values, heights, "o-", color=colour, ms=5, label=entry.get("name"))
+            else:
+                ax.errorbar(values, heights, yerr=[s[key] for s in entry["spreads"]],
+                            fmt="o-", color=colour, ms=5, capsize=3, label=entry.get("name"))
+            if key == "velocity_correlation_length" and "velocity_correlation_bound" in entry["states"][0]:
+                # Separations stop at half the box, so a length sitting on this line
+                # is only a lower bound, not a measurement.
+                ax.plot(values, [s["velocity_correlation_bound"] for s in entry["states"]],
+                        color=plotstyle.INK_MUTED, lw=0.8, ls=":")
         ax.set_title(title, loc="left", pad=6, fontsize=9)
         ax.set_xlabel(label)
         ax.grid(axis="y")
@@ -229,6 +254,8 @@ def observables_figure(values, states, label, reported):
                 ax.axhline(level, color=plotstyle.INK_MUTED, lw=0.8, ls=style)
         if key == "occupancy":
             ax.axhline(1.4, color=plotstyle.SERIES[1], lw=0.8, ls=":")
+        if index == 0 and not single:
+            ax.legend(loc="best")
 
     for spare in range(len(reported), rows * columns):
         axes[spare // columns][spare % columns].set_visible(False)
@@ -246,8 +273,12 @@ def sweep_figure(results, label, log_x=False, tolerance=1e-3):
     """
     plotstyle.use_style()
     n = len(results)
-    fig = plt.figure(figsize=(3.3 * n, 7.4))
-    cells = fig.add_gridspec(2, n, height_ratios=[1.35, 1.0], hspace=0.34, wspace=0.18)
+    # At least two columns, so the bottom row can always be split in two -- with a
+    # single result the right-hand slice would otherwise be empty and refuse to draw.
+    columns = max(n, 2)
+    fig = plt.figure(figsize=(3.3 * columns, 7.4))
+    cells = fig.add_gridspec(2, columns, height_ratios=[1.35, 1.0], hspace=0.34,
+                             wspace=0.18)
 
     for column, (value, trajectory) in enumerate(results):
         ax = fig.add_subplot(cells[0, column])
@@ -262,14 +293,15 @@ def sweep_figure(results, label, log_x=False, tolerance=1e-3):
             loc="left", pad=8, fontsize=9,
         )
 
-    ax = fig.add_subplot(cells[1, : max(1, n // 2)])
+    split = max(1, columns // 2)
+    ax = fig.add_subplot(cells[1, :split])
     for index, (value, trajectory) in enumerate(results):
         energy_axes(ax, trajectory, colour=plotstyle.SERIES[index % 4],
                     label=f"{label} = {value:g}", relative=True)
     ax.set_title("Approach to steady state", loc="left", pad=8)
     ax.legend(loc="upper right")
 
-    ax = fig.add_subplot(cells[1, max(1, n // 2):])
+    ax = fig.add_subplot(cells[1, split:])
     values = [value for value, _ in results]
     for index, (key, name) in enumerate((("area_ratio", "$A/A_0$"),
                                          ("confluence", "confluence error"),
@@ -297,15 +329,26 @@ def sweep_figure(results, label, log_x=False, tolerance=1e-3):
     return fig
 
 
-def save_animation(anim, stem: str, fps: int = 20, prefer: str = "mp4") -> Path:
-    """Write to ``figures/``, as mp4 when ffmpeg is present and gif otherwise."""
-    plotstyle.FIGURES.mkdir(exist_ok=True)
+def save_animation(anim, stem: str, fps: int = 20, prefer: str = "mp4",
+                   directory: Path | str | None = None, dpi: float | None = None) -> Path:
+    """Write the animation, as mp4 when ffmpeg is present and gif otherwise.
+
+    ``directory`` defaults to the repository's ``figures/``; pass the run's own output
+    directory to keep the video next to its ``.npz``.
+
+    ``dpi`` sets the frame resolution and so, for a gif, the file size almost
+    directly. ``None`` takes the style's ``savefig.dpi`` of 200, which is meant for
+    print and makes a 200-frame gif of an 85^2 field about 10 MB; 80 is plenty for an
+    on-screen preview at a sixth of that.
+    """
+    directory = plotstyle.FIGURES if directory is None else Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
     if prefer == "mp4" and animation.writers.is_available("ffmpeg"):
-        path = plotstyle.FIGURES / f"{stem}.mp4"
-        anim.save(path, writer=animation.FFMpegWriter(fps=fps, bitrate=2400))
+        path = directory / f"{stem}.mp4"
+        anim.save(path, writer=animation.FFMpegWriter(fps=fps, bitrate=2400), dpi=dpi)
         return path
     if prefer == "mp4":
         print("  ffmpeg not found -- writing a gif instead")
-    path = plotstyle.FIGURES / f"{stem}.gif"
-    anim.save(path, writer=animation.PillowWriter(fps=fps))
+    path = directory / f"{stem}.gif"
+    anim.save(path, writer=animation.PillowWriter(fps=fps), dpi=dpi)
     return path

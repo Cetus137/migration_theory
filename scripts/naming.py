@@ -47,7 +47,7 @@ def argument_type(default):
     return float  # floats, and the None-valued timestep
 
 
-def encode(model, duration: float, seed: int) -> str:
+def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
     """A filename carrying every parameter, so a run is identifiable from it alone.
 
     Derived from the model's own fields rather than a hand-written list, for the same
@@ -58,6 +58,10 @@ def encode(model, duration: float, seed: int) -> str:
     reading a directory listing. Fields left as ``None`` -- an unset ``timestep`` or
     ``cell_friction`` -- are omitted, since ``None`` means "derived" and printing a
     value would be a lie.
+
+    The run arguments that change the result -- duration, warm-up and seed -- go on the
+    end. Warm-up is included even when zero: two runs differing only in warm-up are
+    different runs, and must not overwrite each other.
     """
     parts = []
     for field in dataclasses.fields(model):
@@ -68,4 +72,4 @@ def encode(model, duration: float, seed: int) -> str:
             continue
         token = ABBREVIATIONS.get(field.name, field.name)
         parts.append(f"{token}{value}" if isinstance(value, str) else f"{token}{value:g}")
-    return "_".join([*parts, f"dur{duration:g}", f"seed{seed}"])
+    return "_".join([*parts, f"dur{duration:g}", f"wu{warmup:g}", f"seed{seed}"])

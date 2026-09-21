@@ -115,9 +115,19 @@ def test_perimeter_of_a_disc(single_cell):
     assert perimeters(fields)[0] == pytest.approx(2 * np.pi * 8.0, rel=0.01)
 
 
-def test_shape_index_of_a_disc_is_near_the_circle_value(single_cell):
+def test_shape_index_of_a_disc_matches_the_profile(single_cell):
+    """``P / sqrt(A)`` with ``A = INT phi^2`` sits above the sharp-interface 3.545 by
+    exactly the profile's area deficit. Compare with that, not with 3.545 -- at this
+    width the bias is 8%, which is the whole point of the caveat in shape_indices."""
     _, fields = single_cell
-    assert shape_indices(fields)[0] == pytest.approx(2 * np.sqrt(np.pi), rel=0.08)
+    radius, width = 8.0, 1.0
+    r = np.linspace(0, radius + 12 * width, 20000)
+    profile = 0.5 * (1 - np.tanh((r - radius) / (np.sqrt(2) * width)))
+    area = 2 * np.pi * np.trapezoid(profile**2 * r, r)
+    expected = 2 * np.pi * radius / np.sqrt(area)
+    measured = shape_indices(fields)[0]
+    assert measured == pytest.approx(expected, rel=0.02)
+    assert measured > 2 * np.sqrt(np.pi)  # the bias is upward
 
 
 def test_centre_of_mass_recovers_a_wrapped_cell():

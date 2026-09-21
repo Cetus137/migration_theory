@@ -145,9 +145,13 @@ class ExplicitEuler:
         mu = free_energy.functional_derivative(fields)
         rate = -mu / self.friction
         if self.propulsion is not None:
-            # mu is handed on rather than recomputed: under force balance the velocity
-            # is built from the same functional derivative that drives the relaxation.
-            rate = rate + advection(fields, self.propulsion.velocities(tissue, mu))
+            # mu and the gradient are handed on rather than recomputed: under force
+            # balance the velocity is built from the same functional derivative that
+            # drives the relaxation, and the passive force and the advection both
+            # need the same central gradient of the fields.
+            gradient = fields.gradient()
+            velocities = self.propulsion.velocities(tissue, mu, gradient)
+            rate = rate + advection(fields, velocities, gradient)
 
         fields.values += self.dt * rate
         tissue.polarity.rotate(self.dt)

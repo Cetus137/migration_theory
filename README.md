@@ -238,6 +238,8 @@ kind of tissue a run produced, as opposed to what was put into it.
 | `diffusion_coefficient` | `D` from `MSD = 4Dt`, **and the MSD exponent** |
 | `persistent_random_walk` | effective speed and persistence, fitted from the motion achieved |
 | `neighbour_exchange_rate` | T1 rate per cell per unit time, plus mean coordination |
+| `velocity_correlation` | spatial velocity correlation `C(r)` and the length over which it decays to `1/e` |
+| `velocity_correlations` | that length, whether it is only a lower bound, and the correlation between cells in contact |
 | `tracks` | cell paths with the periodic boundary unwrapped |
 
 **The MSD exponent is the clearest single indicator**: ~2 ballistic, ~1 diffusive, below
@@ -247,6 +249,16 @@ what a solid looks like.
 `persistent_random_walk` returns `speed_ratio` and `persistence_ratio` — measured over
 imposed. Both fall well below 1 in a crowded tissue, and how far below is a direct read
 on confinement.
+
+**Velocity correlations are computed after subtracting the tissue's drift.** Under
+force balance the net active force on the tissue does not cancel, so the whole tissue
+drifts at roughly `1/√N` of the free speed, which with 16 cells is a quarter of it.
+That is motion of the box's contents as a body, and the velocity correlations remove
+it. The MSD-based observables above do not, and are dominated by it at small `N`.
+Separations only reach half the box, under two cell spacings at 16 cells, so a
+correlation length reported at that bound with `velocity_correlation_censored = 1` is
+a lower bound, not a measurement; the model has no alignment term, so any correlation
+is force transmission between neighbours.
 
 Two caveats. The shape index is biased high at finite interface width, because
 `A = ∫φ²` undershoots the sharp-interface area — a perfect circle measures 3.79 rather
