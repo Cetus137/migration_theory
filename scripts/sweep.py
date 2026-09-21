@@ -62,7 +62,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from naming import argument_type, encode
+from naming import add_model_argument, argument_type, encode
 from progress import every_tenth
 from migration_theory import Model, load_trajectory, save_trajectory, simulate, tissue_state
 
@@ -83,8 +83,9 @@ REPORTED = (
 _FIELDS = {f.name: f for f in dataclasses.fields(Model)}
 
 #: The fields a sweep can take. The string-valued ones -- seeding, propulsion,
-#: time_unit -- are choices rather than quantities, so they are held fixed instead.
-SWEEPABLE = [name for name, f in _FIELDS.items() if not isinstance(f.default, str)]
+#: time_unit -- and the flags are choices rather than quantities, so they are held
+#: fixed instead.
+SWEEPABLE = [name for name, f in _FIELDS.items() if not isinstance(f.default, (str, bool))]
 
 
 def parse_args():
@@ -101,8 +102,7 @@ def parse_args():
 
     model = parser.add_argument_group("held fixed")
     for field in _FIELDS.values():
-        model.add_argument(f"--{field.name.replace('_', '-')}", dest=field.name,
-                           type=argument_type(field.default), default=field.default)
+        add_model_argument(model, field)
     run = parser.add_argument_group("run")
     run.add_argument("--duration", type=float, default=5000.0)
     run.add_argument("--warmup", type=float, default=25.0,

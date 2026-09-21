@@ -192,6 +192,21 @@ class Model:
     safety: float = 0.4
     """Fraction of the stability limit to take when ``timestep`` is not given."""
 
+    window: bool = False
+    """Measure each cell on its own window of the grid rather than over the whole box.
+
+    A cell is non-zero on a few percent of a large grid, so working over the whole
+    box for every cell is where the time goes as the tissue grows. This is the first
+    stage of storing cells on windows outright: with it on, the per-snapshot
+    diagnostics -- area, perimeter, centre of mass -- run on each cell's patch, found
+    from the fields at every snapshot. The dynamics still use the dense arrays, so the
+    trajectory is identical and the saving is small for now. Results agree with the
+    dense path to the tail the window drops -- below ``1e-6`` in the field, about
+    ``1e-5`` relative in a perimeter -- except the centre of mass, where the windowed
+    value is the exact centroid and the dense one a circular mean with a small bias
+    for asymmetric cells. Off by default until the dynamics use windows too.
+    """
+
     def __post_init__(self) -> None:
         if self.n_cells < 3:
             raise ValueError(f"need at least 3 cells, got {self.n_cells}")

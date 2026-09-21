@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .diagnostics import areas, confluence_error, overlap_matrix, perimeters
+from .diagnostics import areas, centres_of_mass, confluence_error, overlap_matrix, perimeters
 from .dynamics import Diverged, ExplicitEuler, run
 from .model import Model
 from .tissue import Tissue
@@ -181,8 +181,11 @@ def simulate(
 
     def capture(step: int) -> Snapshot:
         fields = tissue.fields
-        cell_areas = areas(fields)
-        cell_perimeters = perimeters(fields)
+        # With model.window the per-cell measurements run on each cell's own patch of
+        # the grid; the windows are found afresh each snapshot since cells move.
+        windows = fields.windows() if model.window else None
+        cell_areas = areas(fields, windows)
+        cell_perimeters = perimeters(fields, windows)
         contacts = overlap_matrix(fields)
         np.fill_diagonal(contacts, 0.0)
         snapshot = Snapshot(
@@ -194,7 +197,7 @@ def simulate(
             shape_index=float((cell_perimeters / np.sqrt(cell_areas)).mean()),
             confluence=confluence_error(fields),
             occupancy=float(fields.occupancy.max()),
-            centres=tissue.centres_of_mass(),
+            centres=centres_of_mass(fields, windows),
             areas=cell_areas,
             perimeters=cell_perimeters,
             contacts=contacts,

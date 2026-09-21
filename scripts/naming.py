@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 
-__all__ = ["ABBREVIATIONS", "NOT_IN_NAME", "encode", "argument_type"]
+__all__ = ["ABBREVIATIONS", "NOT_IN_NAME", "encode", "argument_type", "add_model_argument"]
 
 #: Parameters deliberately left out of the filename. ``time_unit`` is a label -- it
 #: changes nothing about a run, so including it would only make names longer.
@@ -35,6 +35,7 @@ ABBREVIATIONS = {
     "grid_spacing": "dx",
     "timestep": "dt",
     "safety": "saf",
+    "window": "win",
 }
 
 
@@ -47,6 +48,21 @@ def argument_type(default):
     return float  # floats, and the None-valued timestep
 
 
+def add_model_argument(group, field) -> None:
+    """One command-line option for one ``Model`` field.
+
+    A boolean field becomes a plain flag, ``--window`` rather than ``--window 1``,
+    that flips the default; everything else takes a value of the field's type.
+    """
+    flag = f"--{field.name.replace('_', '-')}"
+    if isinstance(field.default, bool):
+        group.add_argument(flag, dest=field.name, default=field.default,
+                           action="store_false" if field.default else "store_true")
+    else:
+        group.add_argument(flag, dest=field.name, default=field.default,
+                           type=argument_type(field.default))
+
+
 def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
     """A filename carrying every parameter, so a run is identifiable from it alone.
 
@@ -57,7 +73,8 @@ def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
     The ``.npz`` stores every parameter too and is authoritative; this is for the human
     reading a directory listing. Fields left as ``None`` -- an unset ``timestep`` or
     ``cell_friction`` -- are omitted, since ``None`` means "derived" and printing a
-    value would be a lie.
+    value would be a lie. A boolean field appears as its bare token only when set, so
+    names of runs made before the flag existed are unchanged.
 
     The run arguments that change the result -- duration, warm-up and seed -- go on the
     end. Warm-up is included even when zero: two runs differing only in warm-up are
@@ -71,5 +88,9 @@ def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
         if value is None:
             continue
         token = ABBREVIATIONS.get(field.name, field.name)
+        if isinstance(value, bool):
+            if value:
+                parts.append(token)
+            continue
         parts.append(f"{token}{value}" if isinstance(value, str) else f"{token}{value:g}")
     return "_".join([*parts, f"dur{duration:g}", f"wu{warmup:g}", f"seed{seed}"])

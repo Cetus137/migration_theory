@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from naming import argument_type, encode
+from naming import add_model_argument, encode
 from migration_theory import Model, save_trajectory, simulate, tissue_state
 
 def parse_args():
@@ -40,12 +40,7 @@ def parse_args():
     )
     model = parser.add_argument_group("model parameters")
     for field in dataclasses.fields(Model):
-        model.add_argument(
-            f"--{field.name.replace('_', '-')}",
-            dest=field.name,
-            type=argument_type(field.default),
-            default=field.default,
-        )
+        add_model_argument(model, field)
     run = parser.add_argument_group("run")
     run.add_argument("--duration", type=float, default=2000.0, help="physical time")
     run.add_argument("--seed", type=int, default=0)

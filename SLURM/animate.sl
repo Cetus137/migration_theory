@@ -2,7 +2,7 @@
 #SBATCH --job-name      animate
 #SBATCH --partition     short
 #SBATCH --mem           4G
-#SBATCH --time          04:00:00
+#SBATCH --time          10:00:00
 #SBATCH --cpus-per-task 1
 #SBATCH --output        slogs/animate.%j.out
 #SBATCH --exclude       compg009,compg010,compg011,compg013
@@ -25,7 +25,7 @@
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 REPO=/users/kir-fritzsche/aif490/devel/migration_theory
-TAG=activity_eps10                  # all outputs go to figures/${TAG}/
+TAG=activity_eps40                  # all outputs go to figures/${TAG}/
 
 # free energy (energy units are whatever alpha is quoted in; lengths in um)
 ALPHA=0.5                           # double-well depth; with K sets width sqrt(K/alpha) = 2 um
@@ -52,10 +52,11 @@ TIME_UNIT=s
 # numerics
 GRID_SPACING=1.0                    # dx in um; pure resolution, appears in no physical quantity
 SAFETY=0.4                          # fraction of the stability limit the timestep takes
+WINDOW=""                           # "--window" measures each cell on its own patch of the grid; same numbers, stage 1 of windowed storage
 
 # run
 SEED=0
-DURATION=100                      # physical time; 10 persistence times at D_r = 1e-3
+DURATION=5000                      # physical time; 10 persistence times at D_r = 1e-3
 WARMUP=25                           # passive relaxation before recording
 TRANSIENT=0.2                       # fraction of the run discarded before measuring
 
@@ -96,6 +97,7 @@ python3 -u ${REPO}/scripts/animate.py \
     --time-unit            ${TIME_UNIT} \
     --grid-spacing         ${GRID_SPACING} \
     --safety               ${SAFETY} \
+    ${WINDOW} \
     --seed                 ${SEED} \
     --duration             ${DURATION} \
     --warmup               ${WARMUP} \

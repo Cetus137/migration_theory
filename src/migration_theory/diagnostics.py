@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .fields import PhaseFields
+from .fields import PhaseFields, Windows
 
 __all__ = [
     "areas",
@@ -31,13 +31,34 @@ __all__ = [
     "confluence_error",
 ]
 
+# Each per-cell measurement takes an optional ``windows``. Without it the measurement
+# runs over the whole grid for every cell, the dense reference. With it, only each
+# cell's own patch is touched -- the same number to rounding, at a cost that scales
+# with the cell rather than the box. The windows are computed by
+# ``PhaseFields.windows`` and are the first stage of storing cells that way outright.
 
-def areas(fields: PhaseFields) -> np.ndarray:
+
+def areas(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
     """``(n_cells,)`` area of each cell, ``\\int phi_i^2``."""
-    return fields.grid.integrate(fields.values**2)
+    if windows is None:
+        return fields.grid.integrate(fields.values**2)
+    return (windows.extract(fields.values) ** 2).sum(axis=(-2, -1)) * fields.grid.cell_area
 
 
-def perimeters(fields: PhaseFields) -> np.ndarray:
+def _padded(windows: Windows, patches: np.ndarray) -> np.ndarray:
+    """Windows with a one-point border for stencils.
+
+    Zero beyond the window, since the field there is below the window threshold --
+    unless the window spans the whole axis, in which case it is periodic like the
+    grid and the border wraps, so the degenerate window reproduces the dense result.
+    """
+    rows = "wrap" if windows.spans_rows else "constant"
+    cols = "wrap" if windows.spans_cols else "constant"
+    padded = np.pad(patches, ((0, 0), (1, 1), (0, 0)), mode=rows)
+    return np.pad(padded, ((0, 0), (0, 0), (1, 1)), mode=cols)
+
+
+def perimeters(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
     r"""``(n_cells,)`` perimeter of each cell, ``\int |grad phi_i| d^2r``.
 
     Exact in the sharp-interface limit for any profile that runs monotonically from 1
@@ -45,8 +66,14 @@ def perimeters(fields: PhaseFields) -> np.ndarray:
     transition is shaped, so what survives is the length of the level set. No contour
     has to be extracted and no shape assumed.
     """
-    d_dx, d_dy = fields.grid.gradient(fields.values)
-    return fields.grid.integrate(np.hypot(d_dx, d_dy))
+    grid = fields.grid
+    if windows is None:
+        d_dx, d_dy = grid.gradient(fields.values)
+        return grid.integrate(np.hypot(d_dx, d_dy))
+    padded = _padded(windows, windows.extract(fields.values))
+    d_dx = (padded[:, 1:-1, 2:] - padded[:, 1:-1, :-2]) / (2.0 * grid.dx)
+    d_dy = (padded[:, 2:, 1:-1] - padded[:, :-2, 1:-1]) / (2.0 * grid.dy)
+    return np.hypot(d_dx, d_dy).sum(axis=(-2, -1)) * grid.cell_area
 
 
 def shape_indices(fields: PhaseFields) -> np.ndarray:
@@ -94,9 +121,27 @@ def contact_lengths(fields: PhaseFields, interface_width: float) -> np.ndarray:
     return lengths
 
 
-def centres_of_mass(fields: PhaseFields) -> np.ndarray:
-    """``(n_cells, 2)`` centroid of each cell, correct across the periodic boundary."""
-    return fields.grid.centre_of_mass(fields.values**2)
+def centres_of_mass(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
+    """``(n_cells, 2)`` centroid of each cell, correct across the periodic boundary.
+
+    The dense version has to average angles around the periodic circle, which is
+    exact for a symmetric cell but carries a small bias, third moment times
+    ``(2 pi / L)^2 / 6``, for an asymmetric one -- a few hundredths of a micron here.
+    A window never wraps internally, so the windowed version is the plain centroid
+    over unwrapped coordinates, wrapped once at the end: exact, and the two agree to
+    that bias rather than to rounding.
+    """
+    if windows is None:
+        return fields.grid.centre_of_mass(fields.values**2)
+    weights = windows.extract(fields.values) ** 2
+    X, Y = windows.coordinates()
+    total = weights.sum(axis=(-2, -1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        centre = np.column_stack([
+            (weights * X).sum(axis=(-2, -1)) / total,
+            (weights * Y).sum(axis=(-2, -1)) / total,
+        ])
+    return np.where((total == 0)[:, None], np.nan, fields.grid.box.wrap(centre))
 
 
 def confluence_error(fields: PhaseFields) -> float:

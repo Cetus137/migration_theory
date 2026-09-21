@@ -37,7 +37,7 @@ from .diagnostics import (
     perimeters,
     shape_indices,
 )
-from .fields import PhaseFields, seed, seed_tessellated
+from .fields import PhaseFields, Windows, seed, seed_tessellated
 from .free_energy import (
     Adhesion,
     AreaConstraint,
@@ -91,6 +91,7 @@ __all__ = [
     "Tracks",
     "Trajectory",
     "UnstableTimestep",
+    "Windows",
     "Polarity",
     "advection",
     "areas",

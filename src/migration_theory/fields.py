@@ -21,7 +21,110 @@ import numpy as np
 
 from .grid import Grid
 
-__all__ = ["PhaseFields", "seed", "seed_tessellated"]
+__all__ = ["PhaseFields", "Windows", "seed", "seed_tessellated"]
+
+
+@dataclass(frozen=True)
+class Windows:
+    """Where each cell is: one small patch of the grid per cell, all the same shape.
+
+    A cell of radius ``R`` with interface ``w`` is non-zero within about ``R + 3w`` of
+    its centre, a few percent of a large box, yet the dense ``(n_cells, ny, nx)``
+    layout stores and processes every cell over the whole grid. A window is the
+    patch that actually holds the cell: a common ``shape`` -- one size for all cells,
+    so a stack of them is a single array -- and per-cell ``origins``, the grid row and
+    column where each window starts.
+
+    Periodicity lives in one place, :meth:`indices`: a window that runs off the edge
+    of the box has its indices taken modulo the grid size, so a cell straddling the
+    boundary reads and writes as an ordinary small array with no wrap inside it.
+    """
+
+    grid: Grid
+    shape: tuple[int, int]
+    """``(h, w)``: rows and columns of every window."""
+
+    origins: np.ndarray
+    """``(n_cells, 2)`` integers: the ``(row, col)`` of each window's first point."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origins", np.asarray(self.origins, dtype=int))
+        h, w = self.shape
+        if not (1 <= h <= self.grid.ny and 1 <= w <= self.grid.nx):
+            raise ValueError(f"window {self.shape} does not fit the grid {self.grid.shape}")
+        if self.origins.ndim != 2 or self.origins.shape[1] != 2:
+            raise ValueError(f"origins must have shape (n_cells, 2), got {self.origins.shape}")
+
+    @property
+    def n_cells(self) -> int:
+        return len(self.origins)
+
+    @property
+    def spans_rows(self) -> bool:
+        """Whether the window covers the whole y axis, so it wraps onto itself."""
+        return self.shape[0] == self.grid.ny
+
+    @property
+    def spans_cols(self) -> bool:
+        return self.shape[1] == self.grid.nx
+
+    def indices(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(rows, cols)``, each ``(n_cells, h or w)``, wrapped into the grid."""
+        h, w = self.shape
+        rows = (self.origins[:, 0, None] + np.arange(h)) % self.grid.ny
+        cols = (self.origins[:, 1, None] + np.arange(w)) % self.grid.nx
+        return rows, cols
+
+    def extract(self, values: np.ndarray) -> np.ndarray:
+        """Every cell's window from a dense ``(n_cells, ny, nx)`` stack: ``(n_cells, h, w)``."""
+        rows, cols = self.indices()
+        cells = np.arange(self.n_cells)[:, None, None]
+        return values[cells, rows[:, :, None], cols[:, None, :]]
+
+    def mask(self) -> np.ndarray:
+        """``(n_cells, ny, nx)`` booleans, ``True`` inside each cell's window."""
+        rows, cols = self.indices()
+        inside = np.zeros((self.n_cells, self.grid.ny, self.grid.nx), dtype=bool)
+        cells = np.arange(self.n_cells)[:, None, None]
+        inside[cells, rows[:, :, None], cols[:, None, :]] = True
+        return inside
+
+    def coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(X, Y)``, each ``(n_cells, h, w)``: positions of the window points.
+
+        *Unwrapped*: a window straddling the boundary gets coordinates that run past
+        the box edge rather than jumping back to zero, so any average over a window
+        is continuous. Wrap the result with the box afterwards.
+        """
+        h, w = self.shape
+        x = (self.origins[:, 1, None] + np.arange(w)) * self.grid.dx
+        y = (self.origins[:, 0, None] + np.arange(h)) * self.grid.dy
+        target = (self.n_cells, h, w)
+        return np.broadcast_to(x[:, None, :], target), np.broadcast_to(y[:, :, None], target)
+
+
+def _circular_spans(occupied: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Start and extent of the occupied run along a periodic axis, per cell.
+
+    ``occupied`` is ``(n_cells, L)`` booleans. On a periodic axis the occupied indices
+    may straddle the edge -- ``[0, 1, L-1]`` is a run of three, not of ``L`` -- so the
+    run is taken to begin just after the *largest* empty gap around the circle.
+    """
+    starts = np.zeros(len(occupied), dtype=int)
+    extents = np.zeros(len(occupied), dtype=int)
+    length = occupied.shape[1]
+    for k, row in enumerate(occupied):
+        where = np.flatnonzero(row)
+        if len(where) == 0:
+            continue
+        if len(where) == length:
+            extents[k] = length
+            continue
+        gaps = np.diff(np.concatenate([where, [where[0] + length]]))
+        largest = int(np.argmax(gaps))
+        starts[k] = where[(largest + 1) % len(where)]
+        extents[k] = length - gaps[largest] + 1
+    return starts, extents
 
 
 @dataclass
@@ -69,6 +172,40 @@ class PhaseFields:
 
     def laplacian(self) -> np.ndarray:
         return self.grid.laplacian(self.values)
+
+    def windows(self, margin: int = 3, threshold: float = 1e-6) -> Windows:
+        """The patch of the grid each cell occupies, with ``margin`` points to spare.
+
+        Found from the fields themselves: the rows and columns where a cell exceeds
+        ``threshold``, allowing for a cell that straddles the periodic boundary. All
+        windows share one shape, the largest extent over cells plus the margin on
+        each side, capped at the grid -- so on a box barely bigger than a cell the
+        window *is* the grid and everything degenerates to the dense computation.
+        Each cell's occupied run is centred in its window.
+
+        The margin is what lets a stencil on a window treat the outside as zero: the
+        field there is below ``threshold`` by construction. Cells move, so the windows
+        go stale; recompute them every so often, which costs one pass over the stack.
+
+        **On the threshold.** The interface is a ``tanh``, whose tail falls by a factor
+        ``exp(-sqrt(2) dx / w)`` per grid point -- a half per point at ``w = 2 dx`` --
+        so where the window ends is a choice, not a fact: at ``1e-6`` it reaches about
+        ``10 w`` beyond the cell radius, at ``1e-8`` about ``13 w``. The default keeps
+        the window near a tenth of a 75-cell box while what it drops is below ``1e-6``
+        in the field and ``1e-5`` relative in any perimeter.
+        """
+        if margin < 0:
+            raise ValueError(f"margin must be non-negative, got {margin}")
+        present = self.values > threshold
+        row_starts, row_extents = _circular_spans(present.any(axis=2))
+        col_starts, col_extents = _circular_spans(present.any(axis=1))
+        h = min(self.grid.ny, int(row_extents.max()) + 2 * margin)
+        w = min(self.grid.nx, int(col_extents.max()) + 2 * margin)
+        origins = np.column_stack([
+            (row_starts - (h - row_extents) // 2) % self.grid.ny,
+            (col_starts - (w - col_extents) // 2) % self.grid.nx,
+        ])
+        return Windows(self.grid, (h, w), origins)
 
     def copy(self) -> PhaseFields:
         return PhaseFields(self.grid, self.values.copy())

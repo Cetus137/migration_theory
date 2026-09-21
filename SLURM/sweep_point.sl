@@ -64,6 +64,7 @@ TIME_UNIT=s
 # numerics
 GRID_SPACING=1.0                    # dx in um; pure resolution, appears in no physical quantity
 SAFETY=0.4                          # fraction of the stability limit the timestep takes
+WINDOW=""                           # "--window" measures each cell on its own patch of the grid; same numbers, stage 1 of windowed storage
 
 # run
 DURATION=5000                       # physical time; 5 persistence times at D_r = 1e-3
@@ -107,6 +108,7 @@ python3 -u ${REPO}/scripts/sweep.py \
     --time-unit            ${TIME_UNIT} \
     --grid-spacing         ${GRID_SPACING} \
     --safety               ${SAFETY} \
+    ${WINDOW} \
     --duration             ${DURATION} \
     --warmup               ${WARMUP} \
     --snapshots            ${SNAPSHOTS} \
