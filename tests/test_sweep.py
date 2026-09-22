@@ -40,6 +40,26 @@ def test_activity_sets_active_energy_from_the_swept_tension():
         assert model.activity == pytest.approx(3.0)
 
 
+def test_a_fixed_activity_follows_the_swept_tension():
+    """Sweeping tension against friction at one dimensionless activity: E_a is set from
+    each point's own tension, so a = E_a/(sigma R) is the same everywhere, while the
+    remodelling rate K/gamma changes with both axes."""
+    base = Model(propulsion="force", active_energy=99.0)
+    for tension, friction in ((0.1, 5.0), (0.5, 20.0)):
+        model = sweep.apply_point(base, ["tension", "friction"], (tension, friction), activity=3.0)
+        assert model.surface_tension == pytest.approx(tension)
+        assert model.friction == friction
+        assert model.activity == pytest.approx(3.0)
+        assert model.active_energy == pytest.approx(3.0 * tension * model.cell_radius)
+    # Not swept and not asked for: the absolute active energy stands.
+    assert sweep.apply_point(base, ["tension"], (0.5,)).active_energy == 99.0
+    # Swept activity or free speed wins over the fixed one.
+    swept = sweep.apply_point(base, ["activity", "tension"], (5.0, 0.5), activity=3.0)
+    assert swept.activity == pytest.approx(5.0)
+    fast = sweep.apply_point(base, ["free_speed"], (0.1,), activity=3.0)
+    assert fast.free_speed == pytest.approx(0.1)
+
+
 def test_free_speed_holds_the_speed_and_scales_the_force_with_friction():
     """At one free speed on three frictions the speed is equal and E_a rises with xi."""
     base = Model(propulsion="force")

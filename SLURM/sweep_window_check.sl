@@ -25,7 +25,7 @@
 #   sbatch --dependency=afterany:<JOBID> compare_window.sl     (with the same LABEL)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-REPO=/users/kir-fritzsche/aif490/devel/migration_theory
+REPO=${REPO:-/users/kir-fritzsche/aif490/devel/migration_theory}   # override:  sbatch --export=ALL,REPO=/other/checkout ...
 LABEL=${LABEL:-N50_stage3b}         # names the pair of output folders; use it in compare_window.sl too.
                                     # Override without editing:  sbatch --export=ALL,LABEL=xyz sweep_window_check.sl
                                     # N50 = stage 2 windows; N50_stage3 = shared sum from windows (loop);

@@ -7,6 +7,7 @@ import pytest
 
 from migration_theory import (
     Model,
+    cage_relative_motion,
     Snapshot,
     Trajectory,
     diffusion_coefficient,
@@ -15,6 +16,7 @@ from migration_theory import (
     mean_squared_displacement,
     neighbour_exchange_rate,
     neighbour_graph,
+    neighbour_persistence,
     persistent_random_walk,
     save_trajectory,
     shape_statistics,
@@ -24,6 +26,7 @@ from migration_theory import (
     structure,
     velocities,
     velocity_correlation,
+    velocity_correlation_split,
     velocity_correlations,
 )
 
@@ -96,6 +99,22 @@ def test_save_and_load_round_trip(model, tmp_path):
     assert restored.energies == pytest.approx(original.energies)
     assert restored.final.contacts == pytest.approx(original.final.contacts)
     assert restored.tissue is None                    # fields are not stored
+    assert all(s.field is None for s in restored.snapshots)
+
+
+def test_frames_round_trip_when_asked_for(model, tmp_path):
+    """``fields=True`` keeps the display field of every snapshot, in single precision,
+    so a saved run can be rendered again; the final tissue is still not stored."""
+    original = simulate(model, duration=40.0, n_snapshots=4, keep_fields=True)
+    restored = load_trajectory(save_trajectory(original, tmp_path / "frames", fields=True))
+    assert restored.tissue is None
+    for before, after in zip(original.snapshots, restored.snapshots):
+        assert after.field.shape == before.field.shape
+        assert after.field == pytest.approx(before.field, abs=1e-6)
+    # Asked for but not kept: nothing to store, and the file is still readable.
+    without = simulate(model, duration=40.0, n_snapshots=4, keep_fields=False)
+    restored = load_trajectory(save_trajectory(without, tmp_path / "none", fields=True))
+    assert all(s.field is None for s in restored.snapshots)
 
 
 def test_a_dotted_stem_is_not_mistaken_for_an_extension(model, tmp_path):
@@ -181,6 +200,43 @@ def test_a_settled_passive_tissue_exchanges_no_neighbours(model):
     case has to be compared against."""
     trajectory = simulate(model, duration=600, warmup=400, n_snapshots=30, keep_fields=False)
     assert neighbour_exchange_rate(trajectory)["exchange_rate_per_cell"] == pytest.approx(0.0)
+    persistence = neighbour_persistence(trajectory)
+    assert np.all(persistence["Q"] == 1.0)          # every neighbour kept, at every lag
+    assert persistence["censored"] and persistence["final"] == 1.0
+
+
+def _contacts_sequence(model, adjacency_per_frame, interval=10.0):
+    """A trajectory with a prescribed contact graph per frame and static centres."""
+    n = model.n_cells
+    centres = np.zeros((n, 2))
+    snapshots = [
+        Snapshot(step=k, time=interval * k, energy=0.0, breakdown={}, area_ratio=1.0,
+                 shape_index=3.8, confluence=0.0, occupancy=1.0, centres=centres,
+                 areas=np.ones(n), perimeters=np.ones(n), contacts=adj.astype(float))
+        for k, adj in enumerate(adjacency_per_frame)
+    ]
+    return Trajectory(model=model, snapshots=snapshots, tissue=None, dt=interval,
+                      max_dt=interval, steps=len(snapshots), wall_seconds=0.0)
+
+
+def test_neighbour_persistence_reads_a_prescribed_renewal():
+    """Contacts that are all renewed every frame give Q = 0 at every lag, so the
+    half-life is half a frame; contacts that never change give Q = 1 and a censored
+    time at the longest lag."""
+    model = Model(n_cells=6)
+    ring = np.roll(np.eye(6, dtype=bool), 1, axis=1) | np.roll(np.eye(6, dtype=bool), -1, axis=1)
+    frozen = _contacts_sequence(model, [ring] * 20)
+    p = neighbour_persistence(frozen, transient=0.0)
+    assert np.all(p["Q"] == 1.0) and p["censored"]
+
+    # Alternate between two disjoint neighbour sets: nothing survives a single frame.
+    other = np.roll(np.eye(6, dtype=bool), 2, axis=1) | np.roll(np.eye(6, dtype=bool), -2, axis=1)
+    renewing = _contacts_sequence(model, [ring, other] * 10)
+    p = neighbour_persistence(renewing, transient=0.0)
+    assert p["Q"][1] == 0.0                              # one lag on: all gone
+    assert p["Q"][2] == 1.0                              # two lags on: all back
+    assert p["neighbour_persistence_time"] == pytest.approx(5.0)   # halfway to the first lag
+    assert not p["censored"]
 
 
 def test_tissue_state_returns_finite_numbers(model):
@@ -192,10 +248,15 @@ def test_tissue_state_returns_finite_numbers(model):
                           "velocity_correlation_length", "neighbour_velocity_correlation",
                           "hexatic_order", "g_second_peak"}
     # This four-cell box is under one cell spacing to its half-length, so g(r) has no
-    # second shell to measure: that height is NaN by design, and everything else finite.
+    # second shell to measure: that height is NaN by design. Forty snapshots less the
+    # transient leave 32, under a lag of 40, so that lag's correlations are NaN by
+    # design too. Everything else is finite.
     assert 0.5 * model.box.min_length < 1.5 * model.cell_spacing
     assert np.isnan(state["g_second_peak"])
-    assert all(np.isfinite(v) for k, v in state.items() if k != "g_second_peak")
+    assert np.isnan(state["velocity_correlation_length_lag40"])
+    by_design = {k for k in state if k == "g_second_peak" or k.endswith("_lag40")}
+    assert all(np.isfinite(v) for k, v in state.items() if k not in by_design)
+    assert state["transverse_lag"] == 20.0
 
 
 # ----------------------------------------------------------------- velocity correlation
@@ -300,6 +361,100 @@ def test_velocities_have_no_net_drift():
     assert drift_speed_ratio(drifting, transient=0.0) == pytest.approx(1.0)
     independent = _walk(model, lambda x, rng: rng.normal(0, 0.1, x.shape))
     assert drift_speed_ratio(independent, transient=0.0) < 0.5
+
+
+def _with_contacts(trajectory, cutoff):
+    """The same trajectory with contacts wherever two centres are within ``cutoff``."""
+    import dataclasses
+
+    box = trajectory.model.box
+    snapshots = [dataclasses.replace(s, contacts=_contacts_by_distance(s.centres, box, cutoff))
+                 for s in trajectory.snapshots]
+    return dataclasses.replace(trajectory, snapshots=snapshots)
+
+
+def _rigid_swirl(model, n_frames=30, interval=10.0, turn=0.2):
+    """A hexagonal patch of cells inside a disc clear of the boundary, rotating rigidly
+    about the box centre by ``turn`` radians over the run, with contacts by plain
+    distance. A rotation is not periodic, so this stays away from the wrap: no cell
+    comes within a tenth of the box of it."""
+    from migration_theory import PeriodicBox
+
+    box, s = model.box, model.cell_spacing
+    centre = 0.5 * box.lengths
+    rows = np.arange(-20, 21)
+    lattice = np.array([[(i + 0.5 * (j % 2)) * s, j * s * np.sqrt(3) / 2]
+                        for j in rows for i in rows])
+    lattice = lattice[np.linalg.norm(lattice, axis=1) < 0.36 * box.min_length]
+    n = len(lattice)
+    assert n >= 20
+    open_box = PeriodicBox(1e6, 1e6)                             # contacts without wrapping
+    snapshots = []
+    for k in range(n_frames):
+        angle = turn * k / (n_frames - 1)
+        rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        centres = centre + lattice @ rotation.T
+        snapshots.append(Snapshot(
+            step=k, time=interval * k, energy=0.0, breakdown={}, area_ratio=1.0,
+            shape_index=3.8, confluence=0.0, occupancy=1.0, centres=centres,
+            areas=np.ones(n), perimeters=np.ones(n),
+            contacts=_contacts_by_distance(centres, open_box, 1.3 * s),
+        ))
+    return Trajectory(model=model, snapshots=snapshots, tissue=None, dt=interval,
+                      max_dt=interval, steps=n_frames, wall_seconds=0.0)
+
+
+def test_cage_relative_motion_tells_a_swirl_from_independent_walkers():
+    """Cells carried round a rigid rotation move with their cages: the cage-relative
+    MSD is a small fraction of the total (zero for a lattice cell, whose cage centroid
+    is itself). Independent random walkers move through theirs: the ratio is about 1,
+    a little above because the cage mean adds noise."""
+    model = Model(n_cells=100)
+    swirl = _rigid_swirl(model)
+    out = cage_relative_motion(swirl, transient=0.0)
+    assert out["cage_lag"] == 20.0
+    assert out["cage_relative_msd_ratio"] < 0.1
+    assert out["cage_motion_fraction"] > 0.8
+    assert out["cage_relative_msd_ratio_lag1"] < 0.1              # a rigid motion at every lag
+
+    model = Model(n_cells=40)
+
+    walkers = _with_contacts(_walk(model, lambda x, rng: rng.normal(0, 0.05, x.shape), n_frames=30,
+                                   interval=10.0, seed=1), 1.3 * model.cell_spacing)
+    noise = cage_relative_motion(walkers, transient=0.0)
+    assert 0.9 < noise["cage_relative_msd_ratio"] < 1.5
+    assert noise["cage_motion_fraction"] < 0.4
+    assert np.isnan(noise["cage_relative_msd_ratio_lag40"])       # 30 frames cannot hold a lag of 40
+
+    # No contacts at all: nothing to compare with.
+    bare = cage_relative_motion(_walk(model, rotation, n_frames=30), transient=0.0)
+    assert np.isnan(bare["cage_relative_msd_ratio"])
+
+
+def test_split_correlation_tells_a_shear_flow_from_a_random_one():
+    """A shear flow ``v = (sin(2 pi y / L), 0)`` is incompressible and closes on itself:
+    cells side by side across the flow move oppositely half a box apart, so ``C_perp``
+    dips well below zero, while along the flow ``C_par`` stays positive. Independent
+    random velocities give neither."""
+    model = Model(n_cells=40)
+    L = model.box.Ly
+    shear = _walk(model, lambda x, rng: np.column_stack([0.05 * np.sin(2 * np.pi * x[:, 1] / L),
+                                                         np.zeros(len(x))]), n_frames=30)
+    split = velocity_correlation_split(shear, transient=0.0, lag=4)
+    assert split["parallel"][0] > 0.5                     # neighbours along the flow agree
+    assert split["perpendicular_min"] < -0.3              # return flow across it
+    assert not split["censored"]
+    assert 0 < split["perpendicular_zero_crossing"] < split["perpendicular_min_separation"]
+    assert len(split["separation"]) == len(split["parallel"]) == len(split["perpendicular"])
+
+    random = _walk(model, lambda x, rng: rng.normal(0, 0.05, x.shape), n_frames=30, seed=1)
+    noise = velocity_correlation_split(random, transient=0.0, lag=4)
+    assert noise["perpendicular_min"] > -0.3
+    assert abs(noise["parallel"][0]) < 0.3
+
+    keys = velocity_correlations(shear, transient=0.0)
+    assert keys["transverse_correlation_min"] < -0.3 and keys["transverse_lag"] == 20.0
+    assert np.isfinite(keys["velocity_zero_crossing_lag4"])
 
 
 def test_velocity_over_a_lag_is_the_displacement_over_that_lag():

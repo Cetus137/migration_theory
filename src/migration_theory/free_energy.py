@@ -24,6 +24,21 @@ import numpy as np
 
 from .diagnostics import areas
 from .fields import PhaseFields, Windows
+from .grid import magnitude, sum_of_squares
+
+
+def ball_volume(radius: float, dimension: int = 2) -> float:
+    """``pi R^2`` in 2D, ``4/3 pi R^3`` in 3D: the volume a round cell of radius ``R`` wants."""
+    if dimension == 2:
+        return np.pi * radius**2
+    if dimension == 3:
+        return 4.0 / 3.0 * np.pi * radius**3
+    raise NotImplementedError(f"ball volume in {dimension}D")
+
+
+def _stiffness(grid) -> float:
+    """``sum_k 4 / h_k**2``: the most negative eigenvalue of the Laplacian, in magnitude."""
+    return sum(4.0 / h**2 for h in grid.spacings)
 
 # Every term's ``functional_derivative`` takes an optional ``windows``. Without it the
 # derivative is the dense ``(n_cells, ny, nx)`` stack, the reference. With it, the
@@ -50,6 +65,7 @@ __all__ = [
     "Repulsion",
     "Adhesion",
     "AreaConstraint",
+    "ball_volume",
     "interface_terms",
     "interface_width",
     "surface_tension",
@@ -204,8 +220,8 @@ class GradientEnergy:
             raise ValueError(f"K must be positive, got {self.K}")
 
     def density(self, fields: PhaseFields) -> np.ndarray:
-        d_dx, d_dy = fields.grid.forward_gradient(fields.values)
-        return 0.5 * self.K * (d_dx**2 + d_dy**2).sum(axis=0)
+        components = fields.grid.forward_gradient(fields.values)
+        return 0.5 * self.K * sum_of_squares(components).sum(axis=0)
 
     def energy(self, fields: PhaseFields) -> float:
         return float(fields.grid.integrate(self.density(fields)))
@@ -218,14 +234,13 @@ class GradientEnergy:
         return -self.K * windows.laplacian(_patches(fields, windows, shared))
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
-        """``gamma dx**2 / (4 K)`` on a square grid -- usually the binding constraint.
+        """``gamma dx**2 / (2 ndim K)`` on a cubic grid -- usually the binding constraint.
 
         This term makes the evolution a diffusion equation with diffusivity ``K/gamma``.
-        The five-point Laplacian's most negative eigenvalue is ``-(4/dx^2 + 4/dy^2)``,
-        and forward Euler needs ``dt`` times that magnitude below 2.
+        The compact Laplacian's most negative eigenvalue is ``-sum_k 4/h_k^2``, and
+        forward Euler needs ``dt`` times that magnitude below 2.
         """
-        grid = fields.grid
-        rate = self.K * (4.0 / grid.dx**2 + 4.0 / grid.dy**2) / friction
+        rate = self.K * _stiffness(fields.grid) / friction
         return 2.0 / rate
 
 
@@ -376,9 +391,9 @@ class Adhesion:
     def density(self, fields: PhaseFields) -> np.ndarray:
         if self.omega == 0:
             return np.zeros(fields.grid.shape)
-        d_dx, d_dy = fields.grid.forward_gradient(fields.values**2)
-        total = d_dx.sum(axis=0) ** 2 + d_dy.sum(axis=0) ** 2
-        own = (d_dx**2 + d_dy**2).sum(axis=0)
+        components = fields.grid.forward_gradient(fields.values**2)
+        total = sum_of_squares(c.sum(axis=0) for c in components)
+        own = sum_of_squares(components).sum(axis=0)
         return 0.5 * self.omega * (total - own)
 
     def energy(self, fields: PhaseFields) -> float:
@@ -427,10 +442,9 @@ class Adhesion:
         maximised over the grid. Two cells meeting cleanly gives 2, a three-cell vertex
         gives 3. It sets how strongly the off-diagonal coupling adds up.
         """
-        d_dx, d_dy = fields.grid.forward_gradient(fields.values**2)
-        magnitude = np.hypot(d_dx, d_dy)
-        total = magnitude.sum(axis=0) ** 2
-        squares = (magnitude**2).sum(axis=0)
+        size = magnitude(fields.grid.forward_gradient(fields.values**2))
+        total = size.sum(axis=0) ** 2
+        squares = (size**2).sum(axis=0)
         return float(np.max(total / np.maximum(squares, 1e-30)))
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
@@ -448,10 +462,9 @@ class Adhesion:
         """
         if self.omega == 0:
             return np.inf
-        grid = fields.grid
         multiplicity = max(self.contact_multiplicity(fields) - 1.0, 1e-6)
         weight = max(self.coupling_strength(fields), 1e-6)
-        rate = multiplicity * weight * self.omega * (4.0 / grid.dx**2 + 4.0 / grid.dy**2)
+        rate = multiplicity * weight * self.omega * _stiffness(fields.grid)
         return 2.0 * friction / rate
 
 
@@ -499,11 +512,11 @@ class AreaConstraint:
     ``lambda`` is a Python keyword."""
 
     @classmethod
-    def from_radius(cls, radius: float, lambda_: float = 1.0) -> AreaConstraint:
-        """Target the area of a disc of the given radius, ``A_0 = pi R^2``."""
+    def from_radius(cls, radius: float, lambda_: float = 1.0, dimension: int = 2) -> AreaConstraint:
+        """Target the volume of a ball of the given radius: ``pi R^2`` in 2D, ``4/3 pi R^3`` in 3D."""
         if radius <= 0:
             raise ValueError(f"radius must be positive, got {radius}")
-        return cls(float(np.pi * radius**2), lambda_)
+        return cls(float(ball_volume(radius, dimension)), lambda_)
 
     def __post_init__(self) -> None:
         if np.any(np.asarray(self.target_area, dtype=float) <= 0):
@@ -529,12 +542,13 @@ class AreaConstraint:
         self, fields: PhaseFields, windows: Windows | None = None, shared: dict | None = None
     ) -> np.ndarray:
         target = np.asarray(self.target_area, dtype=float)
+        per_cell = (-1,) + (1,) * fields.grid.ndim        # broadcast one number per cell
         if windows is None:
             factor = -4.0 * self.lambda_ * self.mismatch(fields) / target
-            return np.reshape(factor, (-1, 1, 1)) * fields.values
+            return np.reshape(factor, per_cell) * fields.values
         patch = _patches(fields, windows, shared)
         factor = -4.0 * self.lambda_ * self.mismatch(fields, windows, patch) / target
-        return np.reshape(factor, (-1, 1, 1)) * patch
+        return np.reshape(factor, per_cell) * patch
 
     def stability_limit(self, fields: PhaseFields, friction: float) -> float:
         """``gamma A_0 / (4 lambda)``.
@@ -693,4 +707,4 @@ class FreeEnergy:
         properties = self.interface_properties()
         if properties is None:
             return np.inf
-        return properties["interface_width"] / max(grid.dx, grid.dy)
+        return properties["interface_width"] / max(grid.spacings)

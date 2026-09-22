@@ -91,13 +91,24 @@ REPORTED = (
     ("exchange_rate_per_cell", "T1 rate per cell"),
     ("exchanges_per_radius", "T1 per radius crawled"),
     ("exchanges_per_persistence_time", "T1 per persist. time"),
+    ("neighbour_persistence_time", "neighbour persistence (s)"),
     ("shape_index_mean", "shape index q"),
     ("shape_index_std", "q spread"),
     ("measured_speed", "measured speed"),
     ("velocity_correlation_length", "v corr length, lag 1 (um)"),
     ("velocity_correlation_length_lag10", "v corr length, lag 10 (um)"),
+    ("velocity_correlation_length_lag20", "v corr length, lag 20 (um)"),
+    ("velocity_correlation_length_lag40", "v corr length, lag 40 (um)"),
+    ("velocity_zero_crossing_lag20", "C(r) zero crossing, lag 20 (um)"),
     ("neighbour_velocity_correlation", "neighbour v corr, lag 1"),
     ("neighbour_velocity_correlation_lag10", "neighbour v corr, lag 10"),
+    ("neighbour_velocity_correlation_lag20", "neighbour v corr, lag 20"),
+    ("neighbour_velocity_correlation_lag40", "neighbour v corr, lag 40"),
+    ("transverse_correlation_min", "min C_perp, lag 20"),
+    ("transverse_zero_crossing", "C_perp zero crossing (um)"),
+    ("cage_relative_msd_ratio_lag1", "cage-relative MSD ratio, lag 1"),
+    ("cage_relative_msd_ratio", "cage-relative MSD ratio, lag 20"),
+    ("cage_motion_fraction", "cage motion fraction, lag 20"),
     ("drift_speed_ratio", "drift / cell speed"),
     ("hexatic_order", "hexatic |psi6|"),
     ("g_second_peak", "g(r) 2nd peak"),
@@ -136,11 +147,16 @@ SWEEPABLE = [name for name, f in _FIELDS.items()
              if not isinstance(f.default, (str, bool))] + list(PSEUDO)
 
 
-def apply_point(base: Model, fields, combination) -> Model:
+def apply_point(base: Model, fields, combination, activity: float | None = None) -> Model:
     """The model at one point of the sweep: the base with the swept values put in.
 
     Plain fields go straight into ``replace``. ``tension`` then rewrites alpha and K
     at the base's interface width, and ``activity`` last, since it reads the tension.
+
+    ``activity`` holds the *dimensionless* activity ``E_a/(sigma R)`` fixed at every
+    point when it is not itself swept: the active energy is set from each point's own
+    tension, so a sweep over tension is not also a sweep over activity. The absolute
+    ``--active-energy`` is what is held fixed otherwise.
     """
     values = dict(zip(fields, combination))
     if "activity" in values and "free_speed" in values:
@@ -149,6 +165,8 @@ def apply_point(base: Model, fields, combination) -> Model:
     if "tension" in values:
         well, gradient = interface_terms(model.interface_width, values["tension"])
         model = model.replace(alpha=well.alpha, K=gradient.K)
+    if activity is not None and "activity" not in values and "free_speed" not in values:
+        model = model.replace(active_energy=activity * model.surface_tension * model.cell_radius)
     if "activity" in values:
         model = model.replace(
             active_energy=values["activity"] * model.surface_tension * model.cell_radius
@@ -173,6 +191,10 @@ def parse_args():
                         metavar="V", help="the values for the preceding --over")
 
     model = parser.add_argument_group("held fixed")
+    model.add_argument("--activity", type=float, default=None,
+                       help="hold the dimensionless activity E_a/(sigma R) at this value at every "
+                            "point, setting active_energy from each point's tension; overrides "
+                            "--active-energy unless activity or free_speed is swept")
     for field in _FIELDS.values():
         add_model_argument(model, field)
     run = parser.add_argument_group("run")
@@ -241,7 +263,7 @@ def describe(fields, combination, seed=None) -> str:
 
 def run_point(base, fields, combination, seed, args, keep_fields):
     """Simulate one point, save it, and return the trajectory and its observables."""
-    model = apply_point(base, fields, combination)
+    model = apply_point(base, fields, combination, args.activity)
     label = describe(fields, combination, seed)
     for note in model.concerns():
         print(f"  NOTE ({label}): {note}")
@@ -270,7 +292,7 @@ def load_point(base, fields, combination, seed, args):
     whole aggregation: aggregating while the array is still running is a normal
     thing to want.
     """
-    model = apply_point(base, fields, combination)
+    model = apply_point(base, fields, combination, args.activity)
     path = Path(args.outdir) / (encode(model, args.duration, seed, args.warmup) + ".npz")
     if not path.exists():
         return None
@@ -281,11 +303,36 @@ def load_point(base, fields, combination, seed, args):
         return None
 
 
+#: Reported as well when the runs have a minority population (``Model.minority_count``
+#: above zero): the same motion measured on the odd cells and on the rest.
+MINORITY_REPORTED = (
+    ("minority_speed", "minority speed"),
+    ("bulk_speed", "bulk speed"),
+    ("minority_speed_ratio", "minority / bulk speed"),
+    ("minority_diffusion_coefficient", "minority D"),
+    ("minority_msd_exponent", "minority MSD exponent"),
+    ("minority_exchange_rate_per_cell", "minority T1 rate"),
+    ("bulk_exchange_rate_per_cell", "bulk T1 rate"),
+    ("minority_area_ratio", "minority / bulk area"),
+    ("minority_shape_index", "minority q"),
+    ("minority_coordination", "minority neighbours"),
+)
+
+
+def reported_for(results):
+    """The columns to print and plot: the standard set, plus the minority's if present."""
+    states = [state for _, _, state in results if state is not None]
+    if states and "minority_speed" in states[0]:
+        return REPORTED + MINORITY_REPORTED
+    return REPORTED
+
+
 def tabulate(fields, combinations, results, with_spread):
     """Print the table; return each point's mean and spread over seeds, per observable."""
     means, spreads = {}, {}
+    reported = reported_for(results)
     header = "".join(f"{field:>16}" for field in fields) + f"{'seeds':>7}"
-    print("\n" + header + "".join(f"{label:>22}" for _, label in REPORTED))
+    print("\n" + header + "".join(f"{label:>22}" for _, label in reported))
     for combination in combinations:
         states = [state for c, _, state in results if c == combination]
         # Every observable is averaged, not only the printed ones: the figure reads
@@ -296,7 +343,7 @@ def tabulate(fields, combinations, results, with_spread):
         means[combination], spreads[combination] = mean, spread
         cells = (
             f"{mean[key]:.4g} +/- {spread[key]:.2g}" if with_spread else f"{mean[key]:.5g}"
-            for key, _ in REPORTED
+            for key, _ in reported
         )
         print("".join(f"{value:>16g}" for value in combination) + f"{len(states):>7}"
               + "".join(f"{cell:>22}" for cell in cells))
@@ -385,7 +432,7 @@ def main() -> None:
                     "states": [means[c] for c in cs],
                     "spreads": [spreads[c] for c in cs] if with_spread else None,
                 })
-            figure = render.observables_figure(series, fields[0], REPORTED)
+            figure = render.observables_figure(series, fields[0], reported_for(results))
             print(f"\nwrote {plotstyle.save(figure, tag, args.outdir)}")
         if args.states and trajectories:
             if len(fields) == 1:

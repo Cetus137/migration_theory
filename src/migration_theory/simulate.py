@@ -21,7 +21,14 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .diagnostics import areas, centres_of_mass, confluence_error, overlap_matrix, perimeters
+from .diagnostics import (
+    areas,
+    centres_of_mass,
+    confluence_error,
+    overlap_matrix,
+    perimeters,
+    shape_index,
+)
 from .dynamics import Diverged, ExplicitEuler, run
 from .model import Model
 from .tissue import Tissue
@@ -61,9 +68,14 @@ class Snapshot:
     """``sum_i phi_i^2``, or ``None`` if fields were not kept."""
 
     @property
+    def ndim(self) -> int:
+        """The tissue's dimension, read from the centres."""
+        return self.centres.shape[1]
+
+    @property
     def shape_indices(self) -> np.ndarray:
-        """``(n_cells,)`` dimensionless shape index ``P / sqrt(A)`` of each cell."""
-        return self.perimeters / np.sqrt(self.areas)
+        """``(n_cells,)`` dimensionless shape index ``P / sqrt(A)`` -- ``S / V^(2/3)`` in 3D."""
+        return shape_index(self.perimeters, self.areas, self.ndim)
 
 
 @dataclass
@@ -195,7 +207,7 @@ def simulate(
             energy=free_energy.energy(fields),
             breakdown=free_energy.breakdown(fields),
             area_ratio=float(cell_areas.mean() / target_area),
-            shape_index=float((cell_perimeters / np.sqrt(cell_areas)).mean()),
+            shape_index=float(shape_index(cell_perimeters, cell_areas, fields.grid.ndim).mean()),
             confluence=confluence_error(fields),
             occupancy=float(fields.occupancy.max()),
             centres=centres_of_mass(fields, windows),
@@ -207,9 +219,14 @@ def simulate(
         if not np.isfinite(snapshot.energy) or not np.isfinite(fields.values).all():
             raise Diverged(
                 f"fields stopped being finite by step {step} (t = {tissue.time:.4g}). "
-                "The free energy is probably unbounded below -- check that adhesion is "
-                "below its ceiling, which is K divided by max(4 phi_i phi_j) and so "
-                "lower than K wherever cells overlap."
+                "Two usual causes. With adhesion: the free energy is unbounded below -- "
+                "check that adhesion is below its ceiling, K divided by max(4 phi_i phi_j), "
+                "which is lower than K wherever cells overlap. With activity: the grid "
+                "Peclet number v dx gamma / K passed its check at the start but the "
+                "cells sped up -- under force balance squeezed cells move faster than "
+                "the free speed -- and central-difference advection went unstable. "
+                "Measured (2026-09-22): at activity 3 this happens on a 1 um grid once "
+                "gamma / K exceeds about 2.5 s/um^2. Refine the grid or lower gamma."
             )
         snapshots.append(snapshot)
         return snapshot
@@ -248,13 +265,19 @@ def simulate(
 _SCALARS = ("step", "time", "energy", "area_ratio", "shape_index", "confluence", "occupancy")
 
 
-def save_trajectory(trajectory: Trajectory, path: str | Path) -> Path:
+def save_trajectory(trajectory: Trajectory, path: str | Path, fields: bool = False) -> Path:
     """Write a trajectory to a compressed ``.npz``.
 
-    Saves the model parameters and every per-snapshot measurement, but not the fields:
-    the display arrays are large and the final tissue larger, while everything
-    :mod:`~migration_theory.analysis` needs is the scalars, centres, areas, perimeters
-    and contacts. A few hundred snapshots of a few dozen cells is well under a megabyte.
+    Saves the model parameters and every per-snapshot measurement, and by default not
+    the fields: the display arrays are large and the final tissue larger, while
+    everything :mod:`~migration_theory.analysis` needs is the scalars, centres, areas,
+    perimeters and contacts. A few hundred snapshots of a few dozen cells is well under
+    a megabyte.
+
+    ``fields=True`` also stores each snapshot's display field ``sum_i phi_i^2`` (single
+    precision, so about 30 MB for 200 frames of a 190^2 grid), which is what lets a run
+    be re-rendered -- in another frame, at another resolution -- without simulating it
+    again. The final tissue is still not saved.
 
     Written because rendering a run and keeping only the video throws away every number
     in it -- and re-simulating to recover them costs far more than storing them did.
@@ -276,6 +299,8 @@ def save_trajectory(trajectory: Trajectory, path: str | Path) -> Path:
     )
     terms = sorted(snapshots[0].breakdown)
     arrays["breakdown"] = np.array([[s.breakdown[t] for t in terms] for s in snapshots])
+    if fields and all(s.field is not None for s in snapshots):
+        arrays["field"] = np.array([s.field for s in snapshots], dtype=np.float32)
     meta = {
         "model": {f.name: getattr(trajectory.model, f.name)
                   for f in dataclasses.fields(trajectory.model)},
@@ -293,9 +318,10 @@ def save_trajectory(trajectory: Trajectory, path: str | Path) -> Path:
 def load_trajectory(path: str | Path) -> Trajectory:
     """Read back a trajectory saved by :func:`save_trajectory`.
 
-    ``tissue`` comes back as ``None`` -- the fields were not saved -- so the result
+    ``tissue`` comes back as ``None`` -- the final fields are not saved -- so the result
     supports everything in :mod:`~migration_theory.analysis` but not the figures that
-    draw the final configuration.
+    draw the final configuration. The per-snapshot display fields come back if the file
+    was written with ``fields=True``, and a video can then be rendered from it.
     """
     path = Path(path)
     if path.suffix != ".npz":
@@ -319,6 +345,7 @@ def load_trajectory(path: str | Path) -> Trajectory:
             areas=arrays["areas"][i],
             perimeters=arrays["perimeters"][i],
             contacts=arrays["contacts"][i],
+            field=arrays["field"][i].astype(float) if "field" in arrays else None,
         )
         for i in range(len(arrays["time"]))
     ]

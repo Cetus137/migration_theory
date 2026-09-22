@@ -8,11 +8,18 @@ from __future__ import annotations
 
 import dataclasses
 
-__all__ = ["ABBREVIATIONS", "NOT_IN_NAME", "encode", "argument_type", "add_model_argument"]
+__all__ = ["ABBREVIATIONS", "NOT_IN_NAME", "OMIT_AT_DEFAULT", "encode", "argument_type",
+           "add_model_argument"]
 
 #: Parameters deliberately left out of the filename. ``time_unit`` is a label -- it
 #: changes nothing about a run, so including it would only make names longer.
 NOT_IN_NAME = {"time_unit"}
+
+#: Parameters that appear in the filename only when set away from their default, so
+#: that names of runs made before they existed are unchanged -- the minority block
+#: describes cells a uniform tissue does not have.
+OMIT_AT_DEFAULT = {"minority_count", "minority_size", "minority_activity",
+                   "minority_persistence", "minority_friction"}
 
 #: Short tokens for the filename. Any field without one falls back to its own name, so
 #: a parameter added to Model appears in the name without anyone remembering to add it.
@@ -36,6 +43,11 @@ ABBREVIATIONS = {
     "timestep": "dt",
     "safety": "saf",
     "window": "win",
+    "minority_count": "min",
+    "minority_size": "minR",
+    "minority_activity": "mina",
+    "minority_persistence": "minp",
+    "minority_friction": "minxi",
 }
 
 
@@ -73,8 +85,9 @@ def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
     The ``.npz`` stores every parameter too and is authoritative; this is for the human
     reading a directory listing. Fields left as ``None`` -- an unset ``timestep`` or
     ``cell_friction`` -- are omitted, since ``None`` means "derived" and printing a
-    value would be a lie. A boolean field appears as its bare token only when set, so
-    names of runs made before the flag existed are unchanged.
+    value would be a lie. A boolean field appears as its bare token only when set, and
+    a field in :data:`OMIT_AT_DEFAULT` only when changed, so names of runs made before
+    either existed are unchanged.
 
     The run arguments that change the result -- duration, warm-up and seed -- go on the
     end. Warm-up is included even when zero: two runs differing only in warm-up are
@@ -86,6 +99,8 @@ def encode(model, duration: float, seed: int, warmup: float = 0.0) -> str:
             continue
         value = getattr(model, field.name)
         if value is None:
+            continue
+        if field.name in OMIT_AT_DEFAULT and value == field.default:
             continue
         token = ABBREVIATIONS.get(field.name, field.name)
         if isinstance(value, bool):

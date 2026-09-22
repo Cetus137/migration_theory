@@ -208,9 +208,49 @@ class Model:
     an overlay on them, so the saving is in time, not yet in memory.
     """
 
+    # --- a minority population ---
+    minority_count: int = 0
+    """How many cells differ from the rest: the first ``minority_count`` of them.
+
+    Zero, the default, is a uniform tissue and computes exactly what it always did.
+    One is a single odd cell to follow through the tissue -- an animation's worth.
+    Its statistics are one sample per run, so for a sweep use several seeds or
+    several such cells; five to ten in a hundred is the dendritic-cell fraction of a
+    lymph node. The ratios below apply to every minority cell alike.
+    """
+
+    minority_size: float = 1.0
+    """Minority radius as a multiple of ``cell_radius``. Its target area follows, as
+    ``pi (size R)^2``, and the box grows to hold the extra area at the same packing."""
+
+    minority_activity: float = 1.0
+    """Minority activity as a multiple of the bulk's, in the dimensionless sense
+    ``a = E_a/(sigma R)`` under force balance -- so a minority cell of any size at ratio 1
+    pushes with the same active *force* ``a sigma`` as its neighbours -- and as a
+    multiple of ``speed`` under imposed velocity."""
+
+    minority_persistence: float = 1.0
+    """Minority persistence time as a multiple of the bulk's, i.e. ``D_r`` divided by it."""
+
+    minority_friction: float = 1.0
+    """Minority cell friction ``xi`` as a multiple of the bulk's.
+
+    A larger cell plausibly drags more on its substrate, but by how much is a
+    modelling choice, so it is stated here rather than assumed: 1 leaves it equal.
+    """
+
     def __post_init__(self) -> None:
         if self.n_cells < 3:
             raise ValueError(f"need at least 3 cells, got {self.n_cells}")
+        if not 0 <= self.minority_count < self.n_cells:
+            raise ValueError(
+                f"minority_count must lie in [0, n_cells), got {self.minority_count}"
+            )
+        for name in ("minority_size", "minority_persistence", "minority_friction"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.minority_activity < 0:                  # zero is a passive obstacle
+            raise ValueError(f"minority_activity must be non-negative, got {self.minority_activity}")
         if self.cell_radius <= 0:
             raise ValueError(f"cell_radius must be positive, got {self.cell_radius}")
         if self.packing <= 0:
@@ -291,13 +331,76 @@ class Model:
 
     @property
     def target_area(self) -> float:
-        """``A_0 = pi R^2``, the area each cell is held towards."""
+        """``A_0 = pi R^2``, the area each bulk cell is held towards."""
         return float(np.pi * self.cell_radius**2)
+
+    # ------------------------------------------------------------- the minority
+
+    @property
+    def has_minority(self) -> bool:
+        return self.minority_count > 0
+
+    @property
+    def is_minority(self) -> np.ndarray:
+        """``(n_cells,)`` booleans: the first ``minority_count`` cells."""
+        return np.arange(self.n_cells) < self.minority_count
+
+    @property
+    def minority_cells(self) -> np.ndarray:
+        """Indices of the minority cells."""
+        return np.arange(self.minority_count)
+
+    @property
+    def bulk_cells(self) -> np.ndarray:
+        """Indices of the ordinary cells."""
+        return np.arange(self.minority_count, self.n_cells)
+
+    def _per_cell(self, bulk: float, ratio: float) -> np.ndarray:
+        """``bulk`` for every cell, times ``ratio`` for the minority."""
+        return np.where(self.is_minority, bulk * ratio, bulk)
+
+    @property
+    def radii(self) -> np.ndarray:
+        """``(n_cells,)`` target radius of every cell."""
+        return self._per_cell(self.cell_radius, self.minority_size)
+
+    @property
+    def target_areas(self) -> np.ndarray:
+        """``(n_cells,)`` target area of every cell."""
+        return np.pi * self.radii**2
+
+    @property
+    def total_target_area(self) -> float:
+        """The area the cells want between them, which with ``packing`` sets the box."""
+        if not self.has_minority or self.minority_size == 1.0:
+            return self.n_cells * self.target_area          # the old arithmetic, exactly
+        return float(self.target_areas.sum())
+
+    @property
+    def active_energies(self) -> np.ndarray:
+        """``(n_cells,)`` ``E_a`` of every cell: ``a_i sigma R_i`` with the minority's
+        activity and radius, so the ratio is one of *activity*, not of energy."""
+        return self._per_cell(self.active_energy, self.minority_activity * self.minority_size)
+
+    @property
+    def speeds(self) -> np.ndarray:
+        """``(n_cells,)`` imposed speed of every cell."""
+        return self._per_cell(self.speed, self.minority_activity)
+
+    @property
+    def rotational_diffusions(self) -> np.ndarray:
+        """``(n_cells,)`` ``D_r`` of every cell."""
+        return self._per_cell(self.rotational_diffusion, 1.0 / self.minority_persistence)
+
+    @property
+    def cell_frictions(self) -> np.ndarray:
+        """``(n_cells,)`` ``xi`` of every cell."""
+        return self._per_cell(self.effective_cell_friction, self.minority_friction)
 
     @property
     def box_length(self) -> float:
         """Side of the box in microns, before rounding to whole grid points."""
-        return float(np.sqrt(self.n_cells * self.target_area / self.packing))
+        return float(np.sqrt(self.total_target_area / self.packing))
 
     @property
     def box_points(self) -> int:
@@ -332,7 +435,7 @@ class Model:
     @property
     def realised_packing(self) -> float:
         """Packing after rounding the box to whole grid points."""
-        return self.n_cells * self.target_area / self.box.area
+        return self.total_target_area / self.box.area
 
     @property
     def cell_spacing(self) -> float:
@@ -410,24 +513,34 @@ class Model:
     # ------------------------------------------------------------------ builders
 
     def free_energy(self) -> FreeEnergy:
+        target = self.target_areas if self.has_minority else self.target_area
         return FreeEnergy(
             DoubleWell(self.alpha),
             GradientEnergy(self.K),
             Repulsion(self.epsilon),
             Adhesion(self.adhesion),
-            AreaConstraint(self.target_area, lambda_=self.area_lambda),
+            AreaConstraint(target, lambda_=self.area_lambda),
         )
 
     def tissue(self, seed: int = 0) -> Tissue:
-        """A fresh tissue: evenly spaced centres, seeded at the target radius."""
+        """A fresh tissue: evenly spaced centres, seeded at the target radius.
+
+        The minority cells are the first ``minority_count`` centres, seeded at their
+        own radius; with tessellated seeding the boundaries sit where the weighted
+        Voronoi puts them, so a larger cell is born larger.
+        """
         box, grid = self.box, self.grid
         centres = evenly_spaced(self.n_cells, box, rng=np.random.default_rng(seed))
         lay_down = seed_tessellated if self.seeding == "tessellated" else seed_circles
-        fields = lay_down(grid, centres, self.cell_radius, self.interface_width)
+        radius = self.radii if self.has_minority else self.cell_radius
+        fields = lay_down(grid, centres, radius, self.interface_width)
+        if self.has_minority:
+            speed, rotation = self.speeds, self.rotational_diffusions
+        else:
+            speed, rotation = self.speed, self.rotational_diffusion
         return Tissue(
             fields,
-            Polarity.random(self.n_cells, self.speed, self.rotational_diffusion,
-                            np.random.default_rng(seed + 1)),
+            Polarity.random(self.n_cells, speed, rotation, np.random.default_rng(seed + 1)),
         )
 
     def propulsion_rule(self):
@@ -436,6 +549,12 @@ class Model:
             return ImposedVelocity() if self.speed else None
         if self.active_energy == 0:
             return None
+        if self.has_minority:
+            return ForceBalance(
+                active_energy=self.active_energies,
+                cell_radius=self.radii,
+                cell_friction=self.cell_frictions,
+            )
         return ForceBalance(
             active_energy=self.active_energy,
             cell_radius=self.cell_radius,
@@ -582,6 +701,13 @@ class Model:
             + (f", persistence {s['persistence_time']:.3g} {u}" if self.free_speed else "")
             + "\n"
         )
+        minority = (
+            f"  minority: {self.minority_count} cell{'s' if self.minority_count > 1 else ''}"
+            f" (index 0..{self.minority_count - 1}) at R x {self.minority_size:g} = "
+            f"{self.cell_radius * self.minority_size:g} um, activity x {self.minority_activity:g}, "
+            f"persistence x {self.minority_persistence:g}, xi x {self.minority_friction:g}\n"
+            if self.has_minority else ""
+        )
         return (
             f"Model(alpha={self.alpha:g}, K={self.K:g}, epsilon={self.epsilon:g}, "
             f"omega={self.adhesion:g}, lambda={self.area_lambda:g}, "
@@ -595,5 +721,5 @@ class Model:
             f"  resolution: {s['points_per_radius']:.1f} points per radius, "
             f"{s['points_per_interface']:.1f} across the interface\n"
             f"  spacing {s['cell_spacing']:.2f} um  packing {s['packing']:.3f}\n"
-            + times + activity
+            + minority + times + activity
         )

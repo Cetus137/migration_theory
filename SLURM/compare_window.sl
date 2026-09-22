@@ -20,12 +20,17 @@
 #
 #   sbatch --dependency=afterany:<WIN_CHECK_JOBID> compare_window.sl
 
-REPO=/users/kir-fritzsche/aif490/devel/migration_theory
+REPO=${REPO:-/users/kir-fritzsche/aif490/devel/migration_theory}   # override:  sbatch --export=ALL,REPO=/other/checkout ...
 LABEL=${LABEL:-N50_stage3b}         # as in sweep_window_check.sl. Override without editing:
                                     #   sbatch --export=ALL,LABEL=N50_stage3 compare_window.sl
-REFERENCE=${REPO}/figures/window_check_${LABEL}_dense
-VARIANT=${REPO}/figures/window_check_${LABEL}_win
-MODE=statistics
+REFERENCE=${REFERENCE:-${REPO}/figures/window_check_${LABEL}_dense}   # override with --export=ALL,REFERENCE=...
+VARIANT=${VARIANT:-${REPO}/figures/window_check_${LABEL}_win}          # a full path, or a folder name under figures/
+MODE=${MODE:-statistics}                # exact | statistics; override with --export=ALL,MODE=exact
+# A bare folder name is taken to live under figures/, so
+#   REFERENCE=window_check_N50_stage3b_win VARIANT=window_check_N50_step2_win MODE=exact sbatch compare_window.sl
+# compares two windowed runs of the same points, e.g. before and after a refactor.
+[ -d "${REFERENCE}" ] || [ ! -d "${REPO}/figures/${REFERENCE}" ] || REFERENCE=${REPO}/figures/${REFERENCE}
+[ -d "${VARIANT}" ]   || [ ! -d "${REPO}/figures/${VARIANT}" ]   || VARIANT=${REPO}/figures/${VARIANT}
 SPREAD_FROM=""                      # a multi-seed sweep at the same points, for spreads; e.g.
                                     # ${REPO}/figures/activity_eps40 for the 16-cell check. Empty:
                                     # differences are reported relative to the dense value instead.

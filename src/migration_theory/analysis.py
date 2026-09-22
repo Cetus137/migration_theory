@@ -16,7 +16,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .grid import magnitude
 from .simulate import Trajectory
+
+
+def _norm(vectors: np.ndarray) -> np.ndarray:
+    """``|v|`` over the last axis -- ``np.hypot`` in 2D, as this module always used."""
+    return magnitude(np.moveaxis(vectors, -1, 0))
 
 __all__ = [
     "Tracks",
@@ -27,10 +33,15 @@ __all__ = [
     "persistent_random_walk",
     "neighbour_graph",
     "neighbour_exchange_rate",
+    "neighbour_persistence",
     "velocities",
     "drift_speed_ratio",
     "velocity_correlation",
+    "velocity_correlation_split",
     "velocity_correlations",
+    "cage_relative_motion",
+    "population_state",
+    "minority_state",
     "pair_correlation",
     "structure",
     "tissue_state",
@@ -80,7 +91,7 @@ def tracks(trajectory: Trajectory) -> Tracks:
     return Tracks(
         times=trajectory.times,
         positions=positions,
-        max_step=float(np.max(np.hypot(steps[..., 0], steps[..., 1]))) if len(steps) else 0.0,
+        max_step=float(np.max(_norm(steps))) if len(steps) else 0.0,
     )
 
 
@@ -131,9 +142,11 @@ def mean_squared_displacement(
     """
     path = tracks(trajectory)
     start = _after_transient(trajectory, transient)
-    positions = path.positions[start:]
-    times = path.times[start:]
+    return _msd_of(path.positions[start:], path.times[start:])
 
+
+def _msd_of(positions: np.ndarray, times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Time-averaged MSD of an unwrapped ``(T, cells, ndim)`` path, against lag time."""
     n_samples = len(positions)
     lags = np.arange(1, n_samples)
     values = np.empty(len(lags))
@@ -143,10 +156,25 @@ def mean_squared_displacement(
     return times[lags] - times[0], values
 
 
+def _fit_msd(lags: np.ndarray, msd: np.ndarray, ndim: int,
+             fit_range: tuple[float, float] = (0.4, 0.8)) -> tuple[float, float]:
+    """``(D, exponent)`` from the middle-to-late part of an MSD curve, as
+    :func:`diffusion_coefficient` fits them."""
+    low, high = (np.array(fit_range) * lags[-1])
+    window = (lags >= low) & (lags <= high) & (msd > 0)
+    if window.sum() < 3:
+        window = msd > 0
+    if window.sum() < 2:
+        return float("nan"), float("nan")
+    slope = np.polyfit(lags[window], msd[window], 1)[0]
+    exponent = np.polyfit(np.log(lags[window]), np.log(msd[window]), 1)[0]
+    return float(slope / (2.0 * ndim)), float(exponent)
+
+
 def diffusion_coefficient(
     trajectory: Trajectory, transient: float = 0.2, fit_range: tuple[float, float] = (0.4, 0.8)
 ) -> dict[str, float]:
-    """Long-time diffusion coefficient from ``MSD = 4 D t`` in two dimensions.
+    """Long-time diffusion coefficient from ``MSD = 2 d D t`` -- ``4 D t`` in two dimensions.
 
     Fitted over the middle-to-late part of the curve (``fit_range`` as fractions of the
     longest lag), avoiding both the short-time ballistic regime and the noisy tail.
@@ -168,7 +196,7 @@ def diffusion_coefficient(
     slope = np.polyfit(lags[window], msd[window], 1)[0]
     exponent = np.polyfit(np.log(lags[window]), np.log(msd[window]), 1)[0]
     return {
-        "diffusion_coefficient": float(slope / 4.0),
+        "diffusion_coefficient": float(slope / (2.0 * trajectory.model.box.ndim)),
         "msd_exponent": float(exponent),
         "msd_final": float(msd[-1]),
     }
@@ -315,6 +343,65 @@ def neighbour_exchange_rate(
     }
 
 
+def neighbour_persistence(
+    trajectory: Trajectory, transient: float = 0.2, threshold: float = 0.05
+) -> dict[str, float | np.ndarray]:
+    r"""How long a cell keeps its neighbours.
+
+    .. math::
+
+        Q(t) = \frac{\sum_{t_0}\sum_i |N_i(t_0) \cap N_i(t_0 + t)|}
+                    {\sum_{t_0}\sum_i |N_i(t_0)|}
+
+    the fraction of the neighbours a cell has at one moment that it still has a time
+    ``t`` later, pooled over every starting moment after the transient and every cell.
+    ``Q(0) = 1``; in a jammed tissue it stays there, since cells keep their neighbours
+    for ever, and in a fluid it decays, on the timescale over which a cell's
+    surroundings are renewed. That timescale -- ``neighbour_persistence_time``, where
+    ``Q`` first falls to a half, interpolated -- is the cage lifetime of the glass
+    literature, and the single number that says how quickly a cell meets new cells.
+
+    It is the right measure where the T1 rate is not. The T1 rate counts every change
+    of the contact graph between consecutive samples, so a contact flickering at a gap
+    in a sub-confluent tissue, or two cells brushing past, both register. Here a
+    neighbour counts as kept or lost over a *span*, so flicker averages out, and a
+    brief encounter weighs exactly what it should: little.
+
+    If ``Q`` has not reached a half by the longest lag the run allows, the time is
+    that lag and ``censored`` is set -- a lower bound, the signature of a solid.
+    ``final`` is ``Q`` at that longest lag, the fraction of original neighbours a cell
+    still has at the end, which is informative either way.
+
+    Returns ``lags`` and ``Q`` (the curve), ``neighbour_persistence_time``,
+    ``censored`` and ``final``.
+    """
+    start = _after_transient(trajectory, transient)
+    snapshots = trajectory.snapshots[start:]
+    if len(snapshots) < 3:
+        raise ValueError("too few snapshots to measure neighbour persistence")
+    graphs = np.array([neighbour_graph(s, threshold) for s in snapshots])   # (T, n, n)
+    times = np.array([s.time for s in snapshots])
+
+    # Use lags up to half the record: beyond that too few starting moments remain.
+    max_lag = max(1, (len(snapshots) - 1) // 2)
+    lags = np.arange(1, max_lag + 1)
+    kept = np.empty(len(lags))
+    for k, lag in enumerate(lags):
+        had = graphs[:-lag].sum()
+        kept[k] = (graphs[:-lag] & graphs[lag:]).sum() / had if had else float("nan")
+    curve_t = np.concatenate([[0.0], times[lags] - times[0]])
+    curve_q = np.concatenate([[1.0], kept])
+
+    persistence, censored = _decay_length(curve_t, curve_q, 0.5, float(curve_t[-1]))
+    return {
+        "lags": curve_t,
+        "Q": curve_q,
+        "neighbour_persistence_time": persistence,
+        "censored": censored,
+        "final": float(curve_q[-1]),
+    }
+
+
 # --------------------------------------------------------------------- velocities
 
 
@@ -373,8 +460,8 @@ def drift_speed_ratio(trajectory: Trajectory, transient: float = 0.2) -> float:
     if len(times) < 2:
         return float("nan")
     velocity = np.diff(positions, axis=0) / np.diff(times)[:, None, None]
-    drift = np.hypot(*velocity.mean(axis=1).T).mean()
-    cells = np.hypot(velocity[..., 0], velocity[..., 1]).mean()
+    drift = _norm(velocity.mean(axis=1)).mean()
+    cells = _norm(velocity).mean()
     return float(drift / cells) if cells > 0 else float("nan")
 
 
@@ -418,7 +505,7 @@ def velocity_correlation(
     i, j = np.triu_indices(n_cells, 1)
 
     separation = box.min_image(positions[:, i] - positions[:, j])
-    distance = np.hypot(separation[..., 0], separation[..., 1]).ravel()
+    distance = _norm(separation).ravel()
     products = (velocity[:, i] * velocity[:, j]).sum(axis=-1).ravel()
     normalisation = float((velocity**2).sum(axis=-1).mean())
 
@@ -459,9 +546,98 @@ def _decay_length(r: np.ndarray, c: np.ndarray, level: float, r_max: float) -> t
 
 
 #: Lags, in sample intervals, at which the velocity correlations are reported. At the
-#: sweeps' 25 s sampling these are 25, 100, 250 and 500 s: from cage jostling to the
-#: slow collective motion that lasts a good part of a persistence time.
-CORRELATION_LAGS = (1, 4, 10, 20)
+#: sweeps' 25 s sampling these are 25, 100, 250, 500 and 1000 s: from cage jostling to
+#: the slow collective motion over a whole persistence time, ``1 / D_r = 1000 s`` at
+#: the sweeps' ``D_r = 1e-3``.
+CORRELATION_LAGS = (1, 4, 10, 20, 40)
+
+
+#: The lag at which the correlation is split along and across the separation. Long
+#: enough for cage jostling to average out; 500 s at the sweeps' sampling.
+SPLIT_LAG = 20
+
+
+def velocity_correlation_split(
+    trajectory: Trajectory, transient: float = 0.2, lag: int = SPLIT_LAG,
+    bin_width: float | None = None,
+) -> dict[str, np.ndarray | float | bool]:
+    r"""The velocity correlation along and across the pair separation.
+
+    .. math::
+
+        C_\parallel(r) = \frac{\langle (\mathbf{v}_i\cdot\hat{\mathbf{r}}_{ij})
+                                       (\mathbf{v}_j\cdot\hat{\mathbf{r}}_{ij}) \rangle}
+                              {\tfrac{1}{2}\langle |\mathbf{v}|^2 \rangle}, \qquad
+        C_\perp(r) = \frac{\langle (\mathbf{v}_i\cdot\hat{\mathbf{n}}_{ij})
+                                   (\mathbf{v}_j\cdot\hat{\mathbf{n}}_{ij}) \rangle}
+                          {\tfrac{1}{2}\langle |\mathbf{v}|^2 \rangle}
+
+    with ``n`` the in-plane normal to the separation, each normalised so that both
+    are 1 at ``r = 0``. Two-dimensional.
+
+    The split is what tells a mechanism from a number. In a confluent, area-conserving
+    tissue a moving cell must displace the cells ahead of it and draw in those behind,
+    so ``C_par`` is positive and long-ranged; the flow has to close, so cells *beside*
+    a moving chain move the other way and ``C_perp`` turns negative a spacing or two
+    out -- the signature of incompressible, swirling motion. Measured (2026-09-22, 50
+    to 100 cells, activity 4): ``C_perp`` crosses zero at 1.4 to 1.6 spacings and
+    reaches ``-0.2`` to ``-0.3`` at 2.5 to 3, independently of persistence time, lag
+    and box size, while the ``1/e`` correlation length of the full ``C(r)`` sat at the
+    first shell and measured nothing.
+
+    Returns ``separation``, ``parallel``, ``perpendicular``, ``counts``, plus
+    ``perpendicular_min`` and ``perpendicular_min_separation`` (the depth and place of
+    the transverse dip) and ``perpendicular_zero_crossing`` (where ``C_perp`` first
+    turns negative; the half box, with ``censored``, if it never does).
+    """
+    _, velocity, positions = velocities(trajectory, transient, lag)
+    model = trajectory.model
+    box = model.box
+    if box.ndim != 2:
+        raise NotImplementedError("the along/across split is two-dimensional")
+    n_cells = velocity.shape[1]
+    i, j = np.triu_indices(n_cells, 1)
+
+    separation = box.min_image(positions[:, i] - positions[:, j])          # (T, pairs, 2)
+    distance = _norm(separation)
+    unit = separation / np.maximum(distance, 1e-12)[..., None]
+    normal = np.stack([-unit[..., 1], unit[..., 0]], axis=-1)
+    along = (velocity[:, i] * unit).sum(-1) * (velocity[:, j] * unit).sum(-1)
+    across = (velocity[:, i] * normal).sum(-1) * (velocity[:, j] * normal).sum(-1)
+    per_component = 0.5 * float((velocity**2).sum(axis=-1).mean())
+
+    r_max = 0.5 * box.min_length
+    width = 0.5 * model.cell_spacing if bin_width is None else bin_width
+    edges = np.linspace(0.0, r_max, max(2, int(np.ceil(r_max / width)) + 1))
+    counts, _ = np.histogram(distance.ravel(), edges)
+    parallel, _ = np.histogram(distance.ravel(), edges, weights=along.ravel())
+    perpendicular, _ = np.histogram(distance.ravel(), edges, weights=across.ravel())
+    populated = counts > 0
+    r = 0.5 * (edges[1:] + edges[:-1])[populated]
+    if per_component > 0:
+        c_par = parallel[populated] / counts[populated] / per_component
+        c_perp = perpendicular[populated] / counts[populated] / per_component
+    else:
+        c_par = c_perp = np.full(len(r), np.nan)
+
+    if len(r) and not np.any(np.isnan(c_perp)):
+        dip = int(np.argmin(c_perp))
+        crossing, censored = _decay_length(
+            np.concatenate([[0.0], r]), np.concatenate([[1.0], c_perp]), 0.0, r_max)
+        minimum, at = float(c_perp[dip]), float(r[dip])
+    else:
+        minimum = at = crossing = float("nan")
+        censored = True
+    return {
+        "separation": r,
+        "parallel": c_par,
+        "perpendicular": c_perp,
+        "counts": counts[populated],
+        "perpendicular_min": minimum,
+        "perpendicular_min_separation": at,
+        "perpendicular_zero_crossing": crossing,
+        "censored": censored,
+    }
 
 
 def _neighbour_correlation(trajectory, transient, threshold, lag) -> float:
@@ -492,6 +668,19 @@ def velocity_correlations(
     first-shell value and the one that is robust however small the box is. A lag the
     run is too short for gives ``NaN``.
 
+    Also per lag, ``velocity_zero_crossing_lag{L}``: where ``C(r)`` first turns
+    negative, in microns. In a confluent tissue ``C`` falls to the first-shell value
+    and then to zero over another spacing or two, so the ``1/e`` length can sit on
+    either side of the first shell depending on a few percent in that value, while
+    the zero crossing moves smoothly. Measured at 2.2 to 2.5 spacings for 50 to 100
+    cells at activity 4, with the half box going from 3.3 to 4.7 spacings.
+
+    At :data:`SPLIT_LAG` (or the longest lag the run allows), the along/across split
+    of :func:`velocity_correlation_split`: ``transverse_correlation_min`` and
+    ``transverse_min_separation``, the depth and place of the negative dip in
+    ``C_perp`` that marks closed, incompressible swirls, ``transverse_zero_crossing``
+    where ``C_perp`` first turns negative, and ``transverse_lag`` the lag used.
+
     The un-suffixed ``velocity_correlation_length`` and
     ``neighbour_velocity_correlation`` are the lag-1 values, as before, with
     ``velocity_correlation_censored`` set to 1 when the length is only a lower bound
@@ -500,23 +689,40 @@ def velocity_correlations(
     """
     start = _after_transient(trajectory, transient)
     available = len(trajectory.snapshots) - start
+    r_max = 0.5 * trajectory.model.box.min_length
     out: dict[str, float] = {}
     for lag in lags:
         if lag >= available:
-            length = neighbour = float("nan")
+            length = neighbour = crossing = float("nan")
             censored = 0.0
         else:
             curve = velocity_correlation(trajectory, transient, lag=lag)
             length = float(curve["correlation_length"])
             censored = float(curve["censored"])
+            crossing, _ = _decay_length(curve["separation"], curve["correlation"], 0.0, r_max)
             neighbour = _neighbour_correlation(trajectory, transient, threshold, lag)
         out[f"velocity_correlation_length_lag{lag}"] = length
         out[f"neighbour_velocity_correlation_lag{lag}"] = neighbour
+        out[f"velocity_zero_crossing_lag{lag}"] = crossing
         if lag == lags[0]:
             out["velocity_correlation_length"] = length
             out["velocity_correlation_censored"] = censored
             out["neighbour_velocity_correlation"] = neighbour
-    out["velocity_correlation_bound"] = 0.5 * trajectory.model.box.min_length
+    out["velocity_correlation_bound"] = r_max
+
+    possible = [lag for lag in (SPLIT_LAG, *lags) if lag < available]
+    if possible and trajectory.model.box.ndim == 2:
+        split_lag = max(possible) if SPLIT_LAG >= available else SPLIT_LAG
+        split = velocity_correlation_split(trajectory, transient, split_lag)
+        out["transverse_correlation_min"] = split["perpendicular_min"]
+        out["transverse_min_separation"] = split["perpendicular_min_separation"]
+        out["transverse_zero_crossing"] = split["perpendicular_zero_crossing"]
+        out["transverse_lag"] = float(split_lag)
+    else:
+        out["transverse_correlation_min"] = float("nan")
+        out["transverse_min_separation"] = float("nan")
+        out["transverse_zero_crossing"] = float("nan")
+        out["transverse_lag"] = float("nan")
     out["drift_speed_ratio"] = drift_speed_ratio(trajectory, transient)
     return out
 
@@ -558,11 +764,16 @@ def pair_correlation(
     frames = 0
     for snapshot in trajectory.snapshots[start:]:
         separation = box.min_image(snapshot.centres[i] - snapshot.centres[j])
-        counts += np.histogram(np.hypot(separation[:, 0], separation[:, 1]), edges)[0]
+        counts += np.histogram(_norm(separation), edges)[0]
         frames += 1
 
-    shell_area = np.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
-    expected = frames * (n_cells * (n_cells - 1) / 2) * shell_area / box.area
+    if box.ndim == 2:
+        shell = np.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
+    elif box.ndim == 3:
+        shell = (4.0 * np.pi / 3.0) * (edges[1:] ** 3 - edges[:-1] ** 3)
+    else:
+        raise NotImplementedError(f"pair correlation in {box.ndim}D")
+    expected = frames * (n_cells * (n_cells - 1) / 2) * shell / box.volume
     return 0.5 * (edges[1:] + edges[:-1]), counts / expected
 
 
@@ -584,6 +795,9 @@ def structure(trajectory: Trajectory, transient: float = 0.2, threshold: float =
     shell needs a box of at least five spacings, which 16 cells at confluence gives
     only partly and 4 cells not at all. All four come from positions and neighbour
     relations alone, so they can be measured on segmented images the same way.
+
+    The hexatic order and hexagon fraction are two-dimensional notions and are ``NaN``
+    in 3D; the ``g(r)`` peaks are measured in any dimension.
     """
     start = _after_transient(trajectory, transient)
     box = trajectory.model.box
@@ -595,7 +809,7 @@ def structure(trajectory: Trajectory, transient: float = 0.2, threshold: float =
     second = g[(x >= 1.5) & (x < 2.5)]
 
     psi6, hexagons = [], []
-    for snapshot in trajectory.snapshots[start:]:
+    for snapshot in trajectory.snapshots[start:] if box.ndim == 2 else []:
         adjacency = neighbour_graph(snapshot, threshold)
         for k in range(trajectory.model.n_cells):
             neighbours = np.flatnonzero(adjacency[k])
@@ -607,10 +821,147 @@ def structure(trajectory: Trajectory, transient: float = 0.2, threshold: float =
 
     return {
         "hexatic_order": float(np.mean(psi6)) if psi6 else float("nan"),
-        "hexagon_fraction": float(np.mean(hexagons)),
+        "hexagon_fraction": float(np.mean(hexagons)) if hexagons else float("nan"),
         "g_first_peak": float(first.max()) if len(first) else float("nan"),
         "g_second_peak": float(second.max()) if len(second) else float("nan"),
     }
+
+
+# --------------------------------------------------------------------- cage-relative motion
+
+
+def cage_relative_motion(
+    trajectory: Trajectory,
+    transient: float = 0.2,
+    threshold: float = 0.05,
+    lags: tuple[int, ...] = CORRELATION_LAGS,
+) -> dict[str, float]:
+    r"""Does a cell move *through* its neighbours, or *with* them?
+
+    Over each lag ``L``, every cell's displacement ``d_i`` (whole-tissue drift removed)
+    is compared with the mean displacement ``d_cage`` of the cells it was in contact
+    with at the start of the interval:
+
+    .. math::
+
+        \rho_L = \frac{\langle |d_i - d_{\mathrm{cage}}|^2 \rangle}{\langle |d_i|^2 \rangle},
+        \qquad
+        \kappa_L = \frac{\langle |d_{\mathrm{cage}}|^2 \rangle}{\langle |d_i|^2 \rangle}
+
+    ``cage_relative_msd_ratio_lag{L}`` is :math:`\rho_L`: zero when a cell and its
+    cage move as one -- a stream -- and about 1 when cells move independently (a
+    little above 1, since the cage mean then adds its own noise). ``cage_motion_fraction_lag{L}``
+    is :math:`\kappa_L`: how much of the cell's displacement its cage shares. The
+    un-suffixed keys are the values at :data:`SPLIT_LAG`, or the longest lag the run
+    allows. The same numbers can be taken from tracked cells with segmented contacts,
+    which is what makes them comparable with the lymph node.
+
+    Distinct from the velocity correlation, which asks whether *pairs* at a distance
+    move alike; this asks, cell by cell, how much of its own motion is its own. A
+    cell without contacts at the start of an interval is left out; the ratio is
+    ``NaN`` if no cell has any.
+    """
+    path = tracks(trajectory)
+    start = _after_transient(trajectory, transient)
+    positions = path.positions[start:]
+    snapshots = trajectory.snapshots[start:]
+    available = len(positions)
+    graphs = [neighbour_graph(s, threshold).astype(float) for s in snapshots]
+    out: dict[str, float] = {}
+    for lag in lags:
+        if lag >= available:
+            out[f"cage_relative_msd_ratio_lag{lag}"] = float("nan")
+            out[f"cage_motion_fraction_lag{lag}"] = float("nan")
+            continue
+        displacement = positions[lag:] - positions[:-lag]                    # (T-L, n, ndim)
+        displacement = displacement - displacement.mean(axis=1, keepdims=True)
+        own, relative, cage = 0.0, 0.0, 0.0
+        for k, d in enumerate(displacement):
+            adjacency = graphs[k]
+            degree = adjacency.sum(axis=1)
+            has = degree > 0
+            if not np.any(has):
+                continue
+            cage_mean = (adjacency[has] @ d) / degree[has, None]
+            own += float((d[has] ** 2).sum())
+            relative += float(((d[has] - cage_mean) ** 2).sum())
+            cage += float((cage_mean**2).sum())
+        ratio = relative / own if own > 0 else float("nan")
+        fraction = cage / own if own > 0 else float("nan")
+        out[f"cage_relative_msd_ratio_lag{lag}"] = ratio
+        out[f"cage_motion_fraction_lag{lag}"] = fraction
+    possible = [lag for lag in (SPLIT_LAG, *lags) if lag < available]
+    chosen = (SPLIT_LAG if SPLIT_LAG < available else max(possible)) if possible else None
+    out["cage_relative_msd_ratio"] = (
+        out[f"cage_relative_msd_ratio_lag{chosen}"] if chosen is not None else float("nan"))
+    out["cage_motion_fraction"] = (
+        out[f"cage_motion_fraction_lag{chosen}"] if chosen is not None else float("nan"))
+    out["cage_lag"] = float(chosen) if chosen is not None else float("nan")
+    return out
+
+
+# --------------------------------------------------------------------- populations
+
+
+def population_state(
+    trajectory: Trajectory, cells: np.ndarray, transient: float = 0.2, threshold: float = 0.05
+) -> dict[str, float]:
+    """The motion and shape of a subset of the cells, for a tissue with a minority.
+
+    The same measurements :func:`tissue_state` pools over every cell, taken over
+    ``cells`` alone: ``speed`` (mean displacement per sample interval, in the lab
+    frame), ``diffusion_coefficient`` and ``msd_exponent`` from their own MSD,
+    ``exchange_rate_per_cell`` (neighbour changes these cells are party to, per cell
+    per time -- so one exchange between a minority and a bulk cell counts once for
+    each population), ``coordination`` (mean neighbour count), ``area`` and
+    ``shape_index``. A single cell gives one sample of each: fine for following it
+    through an animation, noisy for a sweep, which wants several cells or seeds.
+    """
+    cells = np.atleast_1d(np.asarray(cells, dtype=int))
+    if len(cells) == 0:
+        raise ValueError("population_state needs at least one cell")
+    path = tracks(trajectory)
+    start = _after_transient(trajectory, transient)
+    positions, times = path.positions[start:, cells], path.times[start:]
+    snapshots = trajectory.snapshots[start:]
+    out: dict[str, float] = {"n_cells": float(len(cells))}
+
+    steps = np.diff(positions, axis=0)
+    intervals = np.diff(times)[:, None]
+    out["speed"] = float((_norm(steps) / intervals).mean()) if len(steps) else float("nan")
+
+    if len(positions) >= 4:
+        lags, msd = _msd_of(positions, times)
+        out["diffusion_coefficient"], out["msd_exponent"] = _fit_msd(lags, msd, positions.shape[-1])
+    else:
+        out["diffusion_coefficient"] = out["msd_exponent"] = float("nan")
+
+    graphs = [neighbour_graph(s, threshold) for s in snapshots]
+    changes = sum(int((a ^ b)[cells].sum()) for a, b in zip(graphs, graphs[1:]))
+    span = snapshots[-1].time - snapshots[0].time
+    out["exchange_rate_per_cell"] = changes / (len(cells) * span) if span > 0 else float("nan")
+    out["coordination"] = float(np.mean([g[cells].sum(axis=1).mean() for g in graphs]))
+
+    out["area"] = float(np.mean([s.areas[cells].mean() for s in snapshots]))
+    out["shape_index"] = float(np.mean([s.shape_indices[cells].mean() for s in snapshots]))
+    return out
+
+
+def minority_state(trajectory: Trajectory, transient: float = 0.2) -> dict[str, float]:
+    """:func:`population_state` of the minority and of the bulk, keyed ``minority_*``
+    and ``bulk_*``, plus ``minority_area_ratio`` (mean minority area over mean bulk
+    area, against the ``minority_size**2`` it was asked for) and ``minority_speed_ratio``.
+    Empty for a uniform tissue."""
+    model = trajectory.model
+    if not getattr(model, "has_minority", False):
+        return {}
+    minority = population_state(trajectory, model.minority_cells, transient)
+    bulk = population_state(trajectory, model.bulk_cells, transient)
+    out = {f"minority_{k}": v for k, v in minority.items()}
+    out.update({f"bulk_{k}": v for k, v in bulk.items()})
+    out["minority_area_ratio"] = minority["area"] / bulk["area"] if bulk["area"] > 0 else float("nan")
+    out["minority_speed_ratio"] = minority["speed"] / bulk["speed"] if bulk["speed"] > 0 else float("nan")
+    return out
 
 
 # --------------------------------------------------------------------- everything
@@ -627,8 +978,14 @@ def tissue_state(trajectory: Trajectory, transient: float = 0.2) -> dict[str, fl
     state.update(diffusion_coefficient(trajectory, transient))
     state.update(persistent_random_walk(trajectory, transient))
     state.update(neighbour_exchange_rate(trajectory, transient))
+    persistence = neighbour_persistence(trajectory, transient)
+    state["neighbour_persistence_time"] = persistence["neighbour_persistence_time"]
+    state["neighbour_persistence_censored"] = float(persistence["censored"])
+    state["neighbour_persistence_final"] = persistence["final"]
     state.update(velocity_correlations(trajectory, transient))
     state.update(structure(trajectory, transient))
+    state.update(cage_relative_motion(trajectory, transient))
+    state.update(minority_state(trajectory, transient))
     path = tracks(trajectory)
     state["max_unwrap_step"] = path.max_step
     state["confluence"] = trajectory.final.confluence

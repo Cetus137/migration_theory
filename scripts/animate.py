@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from naming import add_model_argument, encode
-from migration_theory import Model, save_trajectory, simulate, tissue_state
+from migration_theory import Model, load_trajectory, save_trajectory, simulate, tissue_state
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -60,6 +60,12 @@ def parse_args():
                         help="frame resolution; sets a gif's file size almost directly")
     output.add_argument("--vmin", type=float, default=None, help="colour-scale floor")
     output.add_argument("--vmax", type=float, default=None, help="colour-scale ceiling")
+    output.add_argument("--comoving", action="store_true",
+                        help="render in the frame moving with the tissue's centre of mass, "
+                             "so whole-tissue drift is removed and only relative motion shows")
+    output.add_argument("--load", default=None, metavar="NPZ",
+                        help="render an existing trajectory (one saved by this script, with "
+                             "fields) instead of simulating; the model arguments are ignored")
     output.add_argument("--name", default=None, help="override the generated filename")
     output.add_argument("--outdir", default="figures")
     return parser.parse_args()
@@ -67,32 +73,42 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    model = Model(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Model)})
+    if args.load:
+        trajectory = load_trajectory(args.load)
+        model = trajectory.model
+        name = args.name or Path(args.load).stem
+        print(model)
+        print(f"\nloaded {args.load}")
+    else:
+        model = Model(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Model)})
+        print(model)
+        for note in model.concerns():
+            print(f"  NOTE: {note}")
 
-    print(model)
-    for note in model.concerns():
-        print(f"  NOTE: {note}")
+        # Activity statistics mean nothing over less than a few persistence times, and
+        # that is easy to miss by orders of magnitude -- say so before spending the compute.
+        if model.free_speed:
+            turns = args.duration / model.persistence_time
+            print(f"  run covers {turns:.2f} persistence times"
+                  + ("" if turns >= 3 else "   <- too short for migration statistics"))
 
-    # Activity statistics mean nothing over less than a few persistence times, and that
-    # is easy to miss by orders of magnitude -- say so before spending the compute.
-    if model.free_speed:
-        turns = args.duration / model.persistence_time
-        print(f"  run covers {turns:.2f} persistence times"
-              + ("" if turns >= 3 else "   <- too short for migration statistics"))
+        name = args.name or encode(model, args.duration, args.seed, args.warmup)
+        print(f"\nrunning -> {name}")
 
-    name = args.name or encode(model, args.duration, args.seed, args.warmup)
-    print(f"\nrunning -> {name}")
+        def progress(done, total, snapshot):
+            if done % max(1, total // 10) == 0 or done == total:
+                print(f"  {done}/{total}  t={snapshot.time:.1f}", flush=True)
 
-    def progress(done, total, snapshot):
-        if done % max(1, total // 10) == 0 or done == total:
-            print(f"  {done}/{total}  t={snapshot.time:.1f}", flush=True)
-
-    trajectory = simulate(
-        model, duration=args.duration, seed=args.seed, warmup=args.warmup,
-        n_snapshots=args.frames + 1, keep_fields=not args.no_video, progress=progress,
-    )
-    print(f"  {trajectory.summary_line()}")
-    print(f"  wrote {save_trajectory(trajectory, Path(args.outdir) / name)}")
+        trajectory = simulate(
+            model, duration=args.duration, seed=args.seed, warmup=args.warmup,
+            n_snapshots=args.frames + 1, keep_fields=not args.no_video, progress=progress,
+        )
+        print(f"  {trajectory.summary_line()}")
+        # The frames go into the file too (about 30 MB at 200 frames of a 190^2 grid), so
+        # the run can be re-rendered later with --load, e.g. in the co-moving frame.
+        print(f"  wrote {save_trajectory(trajectory, Path(args.outdir) / name, fields=not args.no_video)}")
+    if args.comoving:
+        name += "_comoving"
 
     if not args.no_video or args.energy:
         import matplotlib
@@ -104,7 +120,8 @@ def main() -> None:
         outdir = Path(args.outdir)
         if not args.no_video:
             animation = render.make_animation(trajectory, fps=args.fps,
-                                              vmin=args.vmin, vmax=args.vmax)
+                                              vmin=args.vmin, vmax=args.vmax,
+                                              comoving=args.comoving)
             print(f"  wrote {render.save_animation(animation, name, fps=args.fps, prefer=args.format, directory=outdir, dpi=args.dpi)}")
         if args.energy:
             print(f"  wrote {plotstyle.save(render.energy_figure(trajectory), name + '_energy', outdir)}")

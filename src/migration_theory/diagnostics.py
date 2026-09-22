@@ -20,16 +20,23 @@ from __future__ import annotations
 import numpy as np
 
 from .fields import PhaseFields, Windows
+from .grid import magnitude
 
 __all__ = [
     "areas",
     "perimeters",
+    "shape_index",
     "shape_indices",
     "overlap_matrix",
     "contact_lengths",
     "centres_of_mass",
     "confluence_error",
 ]
+
+
+def _window_axes(windows: Windows) -> tuple[int, ...]:
+    """The trailing axes of a patch stack that are the window."""
+    return tuple(range(-windows.ndim, 0))
 
 # Each per-cell measurement takes an optional ``windows``. Without it the measurement
 # runs over the whole grid for every cell, the dense reference. With it, only each
@@ -49,7 +56,7 @@ def areas(
         return fields.grid.integrate(fields.values**2)
     if patches is None:
         patches = windows.extract(fields.values)
-    return (patches**2).sum(axis=(-2, -1)) * fields.grid.cell_area
+    return (patches**2).sum(axis=_window_axes(windows)) * fields.grid.cell_volume
 
 
 def perimeters(fields: PhaseFields, windows: Windows | None = None) -> np.ndarray:
@@ -62,18 +69,25 @@ def perimeters(fields: PhaseFields, windows: Windows | None = None) -> np.ndarra
     """
     grid = fields.grid
     if windows is None:
-        d_dx, d_dy = grid.gradient(fields.values)
-        return grid.integrate(np.hypot(d_dx, d_dy))
-    d_dx, d_dy = windows.gradient(windows.extract(fields.values))
-    return np.hypot(d_dx, d_dy).sum(axis=(-2, -1)) * grid.cell_area
+        return grid.integrate(magnitude(grid.gradient(fields.values)))
+    size = magnitude(windows.gradient(windows.extract(fields.values)))
+    return size.sum(axis=_window_axes(windows)) * grid.cell_volume
+
+
+def shape_index(perimeters: np.ndarray, areas: np.ndarray, ndim: int = 2) -> np.ndarray:
+    r"""The dimensionless shape index ``P / A^((d-1)/d)``: ``P / sqrt(A)`` in 2D,
+    ``S / V^(2/3)`` in 3D. In 2D it is computed with ``sqrt``, as it always was."""
+    if ndim == 2:
+        return perimeters / np.sqrt(areas)
+    return perimeters / areas ** ((ndim - 1) / ndim)
 
 
 def shape_indices(fields: PhaseFields) -> np.ndarray:
-    r"""``(n_cells,)`` dimensionless shape index ``P / sqrt(A)``.
+    r"""``(n_cells,)`` dimensionless shape index ``P / sqrt(A)`` -- or ``S / V^(2/3)`` in 3D.
 
     The standard order parameter of tissue mechanics: 3.545 for a circle, 3.72 for a
     regular hexagon, and rising as cells elongate, with ~3.81 the usual rigidity
-    transition threshold.
+    transition threshold in 2D. In 3D a sphere is 4.84 and the transition near 5.4.
 
     Read these with care at finite interface width. ``A`` here is ``\int phi^2``, which
     undershoots the sharp-interface area by a factor depending on the width-to-radius
@@ -81,7 +95,7 @@ def shape_indices(fields: PhaseFields) -> np.ndarray:
     ``w/R = 0.25``. Compare values against each other, not against the literature
     thresholds, unless the interface is sharp.
     """
-    return perimeters(fields) / np.sqrt(areas(fields))
+    return shape_index(perimeters(fields), areas(fields), fields.grid.ndim)
 
 
 def overlap_matrix(fields: PhaseFields) -> np.ndarray:
@@ -94,7 +108,7 @@ def overlap_matrix(fields: PhaseFields) -> np.ndarray:
     pairs, which hands the O(N^2 * grid) work to BLAS and keeps this usable every step.
     """
     squared = (fields.values**2).reshape(fields.n_cells, -1)
-    return (squared @ squared.T) * fields.grid.cell_area
+    return (squared @ squared.T) * fields.grid.cell_volume
 
 
 def contact_lengths(fields: PhaseFields, interface_width: float) -> np.ndarray:
@@ -124,12 +138,11 @@ def centres_of_mass(fields: PhaseFields, windows: Windows | None = None) -> np.n
     if windows is None:
         return fields.grid.centre_of_mass(fields.values**2)
     weights = windows.extract(fields.values) ** 2
-    X, Y = windows.coordinates()
-    total = weights.sum(axis=(-2, -1))
+    axes = _window_axes(windows)
+    total = weights.sum(axis=axes)
     with np.errstate(invalid="ignore", divide="ignore"):
         centre = np.column_stack([
-            (weights * X).sum(axis=(-2, -1)) / total,
-            (weights * Y).sum(axis=(-2, -1)) / total,
+            (weights * coordinate).sum(axis=axes) / total for coordinate in windows.coordinates()
         ])
     return np.where((total == 0)[:, None], np.nan, fields.grid.box.wrap(centre))
 

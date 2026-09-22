@@ -1,4 +1,4 @@
-"""Periodic simulation box: wrapping and minimum-image displacements."""
+"""Periodic simulation box: wrapping and minimum-image displacements, in any dimension."""
 
 from __future__ import annotations
 
@@ -8,43 +8,93 @@ import numpy as np
 
 __all__ = ["PeriodicBox"]
 
+#: Volume per cell of the densest sphere packing, per unit spacing^d: the triangular
+#: lattice in 2D, face-centred cubic in 3D. The natural reference density for a
+#: repulsion whose range is the spacing.
+_DENSEST_PACKING = {2: np.sqrt(3.0) / 2.0, 3: 1.0 / np.sqrt(2.0)}
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, init=False)
 class PeriodicBox:
-    """A rectangular, doubly-periodic 2D box spanning ``[0, Lx) x [0, Ly)``."""
+    """A periodic box spanning ``[0, L_k)`` along each axis.
 
-    Lx: float
-    Ly: float
+    ``PeriodicBox(Lx, Ly)`` is a 2D box, ``PeriodicBox(Lx, Ly, Lz)`` a 3D one, and the
+    lengths are always given in ``(x, y, z)`` order -- the reverse of the array axes a
+    field on the box uses, which run ``(z, y, x)``. Positions and displacements are
+    arrays whose last axis is that same ``(x, y, z)`` order.
+    """
 
-    def __post_init__(self) -> None:
-        if not (self.Lx > 0 and self.Ly > 0):
-            raise ValueError(f"box lengths must be positive, got ({self.Lx}, {self.Ly})")
+    _lengths: tuple[float, ...]
+
+    def __init__(self, *lengths: float) -> None:
+        if len(lengths) == 1 and np.ndim(lengths[0]) == 1:
+            lengths = tuple(lengths[0])
+        values = tuple(float(length) for length in lengths)
+        if not values or not all(length > 0 for length in values):
+            raise ValueError(f"box lengths must be positive, got {values}")
+        object.__setattr__(self, "_lengths", values)
+
+    def __repr__(self) -> str:
+        return f"PeriodicBox({', '.join(f'{length:g}' for length in self._lengths)})"
+
+    @property
+    def ndim(self) -> int:
+        return len(self._lengths)
 
     @property
     def lengths(self) -> np.ndarray:
-        return np.array([self.Lx, self.Ly], dtype=float)
+        """``(ndim,)`` box lengths in ``(x, y, z)`` order."""
+        return np.array(self._lengths, dtype=float)
+
+    @property
+    def Lx(self) -> float:
+        return self._lengths[0]
+
+    @property
+    def Ly(self) -> float:
+        if self.ndim < 2:
+            raise AttributeError("a 1D box has no Ly")
+        return self._lengths[1]
+
+    @property
+    def Lz(self) -> float:
+        if self.ndim < 3:
+            raise AttributeError(f"a {self.ndim}D box has no Lz")
+        return self._lengths[2]
+
+    @property
+    def volume(self) -> float:
+        """The box's measure: area in 2D, volume in 3D."""
+        return float(np.prod(self._lengths))
 
     @property
     def area(self) -> float:
-        return float(self.Lx * self.Ly)
+        """:attr:`volume` under its 2D name, for the code that grew up in 2D."""
+        return self.volume
 
     @property
     def min_length(self) -> float:
-        return float(min(self.Lx, self.Ly))
+        return float(min(self._lengths))
 
     @classmethod
-    def for_cells(cls, n_cells: int, spacing: float, aspect: float = 1.0) -> PeriodicBox:
+    def for_cells(
+        cls, n_cells: int, spacing: float, aspect: float = 1.0, dimension: int = 2
+    ) -> PeriodicBox:
         """Box holding ``n_cells`` at a mean centre-to-centre distance of ``spacing``.
 
-        Sized from the area per cell of a triangular lattice, ``sqrt(3)/2 * spacing**2``.
-        That lattice is the densest packing of discs of diameter ``spacing``, so it is
-        the natural reference state for a repulsion whose range is ``spacing``.
-
-        ``aspect`` is ``Lx / Ly``.
+        Sized from the volume per cell of the densest packing of spheres of diameter
+        ``spacing``: the triangular lattice in 2D, face-centred cubic in 3D. That
+        lattice is the natural reference state for a repulsion whose range is
+        ``spacing``. ``aspect`` is ``Lx / Ly`` and applies in 2D; a 3D box is a cube.
         """
-        area = n_cells * np.sqrt(3.0) / 2.0 * spacing**2
-        Ly = float(np.sqrt(area / aspect))
-        return cls(aspect * Ly, Ly)
+        if dimension not in _DENSEST_PACKING:
+            raise ValueError(f"dimension must be 2 or 3, got {dimension}")
+        volume = n_cells * _DENSEST_PACKING[dimension] * spacing**dimension
+        if dimension == 2:
+            Ly = float(np.sqrt(volume / aspect))
+            return cls(aspect * Ly, Ly)
+        side = float(volume ** (1.0 / 3.0))
+        return cls(side, side, side)
 
     def wrap(self, positions: np.ndarray) -> np.ndarray:
         """Fold positions back into the box."""

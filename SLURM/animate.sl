@@ -26,7 +26,7 @@
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 REPO=/users/kir-fritzsche/aif490/devel/migration_theory
-TAG=activity_eps40                  # all outputs go to figures/${TAG}/
+TAG=friciton_animation_eps40                  # all outputs go to figures/${TAG}/
 
 # free energy (energy units are whatever alpha is quoted in; lengths in um)
 ALPHA=0.5                           # double-well depth; with K sets width sqrt(K/alpha) = 2 um
@@ -37,23 +37,30 @@ AREA_LAMBDA=6000                    # area constraint; sets the timestep at thes
 
 # geometry
 CELL_RADIUS=12                      # um; target area pi R^2
-PACKING=1.0                         # total cell area / box area; 1 is confluent
+PACKING=0.95                         # total cell area / box area; 1 is confluent
 N_CELLS=75
 SEEDING=tessellated                 # tessellated | circles
 
 # dynamics (time in seconds; time_unit is a label only)
-FRICTION=10                         # gamma: resists the field deforming
+FRICTION=20.0                         # gamma: resists the field deforming
 PROPULSION=force                    # force | velocity
 SPEED=0.0                           # v0; velocity mode only
-ACTIVE_ENERGY=28.4                     # E_a; force mode only -- the swept value in the activity sweep
+ACTIVE_ENERGY=8.5                     # E_a; force mode only -- the swept value in the activity sweep
 CELL_FRICTION=10                    # xi: drag on a translating cell; force mode only
-ROTATIONAL_DIFFUSION=1e-3           # D_r; persistence time 1/D_r = 1000 s
+ROTATIONAL_DIFFUSION=1.0e-3           # D_r; persistence time 1/D_r = 10 s
 TIME_UNIT=s
 
 # numerics
 GRID_SPACING=1.0                    # dx in um; pure resolution, appears in no physical quantity
 SAFETY=0.4                          # fraction of the stability limit the timestep takes
 WINDOW="--window"                   # each cell on its own patch: same physics to the 1e-6 tail it drops; 12-16x faster than dense at 50 cells (measured 2026-09-21). "" for dense
+
+# a minority population (0 cells = the uniform tissue, and nothing below matters)
+MINORITY_COUNT=0                    # how many cells differ; they are cells 0..COUNT-1, ringed in the gif
+MINORITY_SIZE=1.0                   # their radius / R  (a dendritic cell among T cells: ~2 to 2.5)
+MINORITY_ACTIVITY=1.0               # their dimensionless activity a / the bulk's (0 = passive obstacle)
+MINORITY_PERSISTENCE=1.0            # their persistence time / the bulk's
+MINORITY_FRICTION=1.0               # their cell friction xi / the bulk's
 
 # run
 SEED=0
@@ -68,6 +75,11 @@ FORMAT=gif                          # gif | mp4
 DPI=80                              # frame resolution; gif size scales with FRAMES x DPI^2 (200 -> ~10 MB, 80 -> ~1.7 MB)
 COLOUR=""                           # e.g. "--vmin 0.5 --vmax 1.2"; empty = automatic from percentiles
 EXTRA="--energy --analyse"          # also write the energy figure and print observables
+COMOVING=""                         # "--comoving" draws the frame moving with the tissue's centre of
+                                    # mass, removing whole-tissue drift; the gif gets a _comoving suffix
+LOAD=""                             # path of an existing .npz from this script to re-render without
+                                    # simulating (the model block above is then ignored); e.g. to see
+                                    # a run you already have in the co-moving frame in a few minutes
 
 module purge
 source /well/kir/config/modules.sh
@@ -78,6 +90,9 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export MPLBACKEND=Agg
 
 mkdir -p ${REPO}/figures/${TAG}
+
+LOADING=""
+[ -n "${LOAD}" ] && LOADING="--load ${LOAD}"
 
 python3 -u ${REPO}/scripts/animate.py \
     --alpha                ${ALPHA} \
@@ -99,6 +114,11 @@ python3 -u ${REPO}/scripts/animate.py \
     --grid-spacing         ${GRID_SPACING} \
     --safety               ${SAFETY} \
     ${WINDOW} \
+    --minority-count       ${MINORITY_COUNT} \
+    --minority-size        ${MINORITY_SIZE} \
+    --minority-activity    ${MINORITY_ACTIVITY} \
+    --minority-persistence ${MINORITY_PERSISTENCE} \
+    --minority-friction    ${MINORITY_FRICTION} \
     --seed                 ${SEED} \
     --duration             ${DURATION} \
     --warmup               ${WARMUP} \
@@ -109,4 +129,6 @@ python3 -u ${REPO}/scripts/animate.py \
     --dpi                  ${DPI} \
     --outdir               ${REPO}/figures/${TAG} \
     ${COLOUR} \
+    ${COMOVING} \
+    ${LOADING} \
     ${EXTRA}

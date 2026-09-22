@@ -31,10 +31,14 @@ class Tissue:
 
     def __post_init__(self) -> None:
         if self.polarity is None:
-            self.polarity = Polarity(np.zeros(self.fields.n_cells))
+            self.polarity = Polarity.still(self.fields.n_cells, self.fields.grid.ndim)
         if self.polarity.n_cells != self.fields.n_cells:
             raise ValueError(
                 f"{self.polarity.n_cells} polarities for {self.fields.n_cells} cells"
+            )
+        if self.polarity.dimension != self.fields.grid.ndim:
+            raise ValueError(
+                f"{self.polarity.dimension}D polarity for a {self.fields.grid.ndim}D tissue"
             )
 
     @classmethod
@@ -48,9 +52,9 @@ class Tissue:
         rotational_diffusion: float = 1.0,
         rng: np.random.Generator | None = None,
     ) -> Tissue:
-        """Circular cells at ``centres``, with random initial polarities."""
+        """Round cells at ``centres``, with random initial polarities."""
         fields = seed(grid, centres, radius, interface_width)
-        polarity = Polarity.random(fields.n_cells, speed, rotational_diffusion, rng)
+        polarity = Polarity.random(fields.n_cells, speed, rotational_diffusion, rng, grid.ndim)
         return cls(fields, polarity)
 
     @property

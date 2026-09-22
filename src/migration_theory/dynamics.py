@@ -28,6 +28,7 @@ import numpy as np
 
 from .activity import advection, field_gradient
 from .free_energy import FreeEnergy
+from .grid import magnitude
 from .tissue import Tissue
 
 __all__ = ["ExplicitEuler", "UnstableTimestep", "Diverged", "run"]
@@ -125,7 +126,7 @@ class ExplicitEuler:
         ) / self.friction
         if diffusivity <= 0:
             return np.inf
-        return speed * tissue.grid.dx / diffusivity
+        return speed * max(tissue.grid.spacings) / diffusivity
 
     def peak_speed(self, tissue: Tissue, free_energy: FreeEnergy) -> float:
         """Largest cell speed right now.
@@ -138,7 +139,7 @@ class ExplicitEuler:
             return 0.0
         mu = free_energy.functional_derivative(tissue.fields)
         velocities = self.propulsion.velocities(tissue, mu)
-        return float(np.max(np.hypot(velocities[:, 0], velocities[:, 1])))
+        return float(np.max(magnitude(velocities.T)))
 
     def check(self, tissue: Tissue, free_energy: FreeEnergy) -> None:
         """Raise if ``dt`` is too large, naming the term responsible."""

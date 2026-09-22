@@ -64,15 +64,16 @@ def free_energy(model: Model) -> FreeEnergy:
 def finite_difference_derivative(free_energy, fields, index, step=1e-5):
     """``dF/dphi`` at one grid point, by central difference of the discrete energy.
 
-    Dividing by the cell area converts the derivative with respect to the stored value
-    into the functional derivative, which is what the terms return.
+    Dividing by the cell volume converts the derivative with respect to the stored value
+    into the functional derivative, which is what the terms return. ``index`` is
+    ``(cell, *grid_index)`` in any dimension.
     """
-    cell, row, column = index
+    index = tuple(index)
     up, down = fields.copy(), fields.copy()
-    up.values[cell, row, column] += step
-    down.values[cell, row, column] -= step
+    up.values[index] += step
+    down.values[index] -= step
     return (free_energy.energy(up) - free_energy.energy(down)) / (
-        2.0 * step * fields.grid.cell_area
+        2.0 * step * fields.grid.cell_volume
     )
 
 

@@ -15,8 +15,8 @@
 #   sbatch tests.sl
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-REPO=/users/kir-fritzsche/aif490/devel/migration_theory
-SELECT=""                           # e.g. "-k repulsion" to run a subset; empty = everything
+REPO=${REPO:-/users/kir-fritzsche/aif490/devel/migration_theory}   # override:  sbatch --export=ALL,REPO=/other/checkout ...
+SELECT="${SELECT:-}"                # e.g. SELECT="-k repulsion" sbatch tests.sl; empty = everything
 
 module purge
 source /well/kir/config/modules.sh

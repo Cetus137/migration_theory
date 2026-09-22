@@ -195,15 +195,44 @@ def colour_limits(snapshots, transient=0.2, span=(1.0, 99.9)):
     return float(low), float(high)
 
 
-def make_animation(trajectory, fps=20, transient=0.2, vmin=None, vmax=None):
-    """The tissue over time. Just the tissue -- see :func:`energy_figure` for the rest."""
+def drift_shifts(trajectory, snapshots):
+    """Whole-tissue displacement since the first frame, ``(n_frames, 2)`` in microns.
+
+    The mean over cells of the unwrapped centre-of-mass paths. Under force balance the
+    net active force does not cancel, so the box's contents slide as a body at about
+    ``1/sqrt(N)`` of the free speed -- a third of the cell speed at 100 cells -- and
+    that is the most eye-catching coherent motion in an animation. Subtracting it
+    shows what the correlation analysis actually measures.
+    """
+    from migration_theory import tracks
+
+    positions = tracks(trajectory).positions.mean(axis=1)           # (n_snapshots, 2)
+    index = {id(s): k for k, s in enumerate(trajectory.snapshots)}
+    rows = [index[id(s)] for s in snapshots]
+    return positions[rows] - positions[rows[0]]
+
+
+def make_animation(trajectory, fps=20, transient=0.2, vmin=None, vmax=None,
+                   comoving=False):
+    """The tissue over time. Just the tissue -- see :func:`energy_figure` for the rest.
+
+    ``comoving`` draws every frame in the frame moving with the tissue's centre of
+    mass: the field is rolled back by the whole-tissue drift, to the nearest grid
+    point, and the markers shifted with it. What streaming survives is motion of
+    cells relative to each other, the only kind the velocity correlations see.
+    """
     snapshots = [s for s in trajectory.snapshots if s.field is not None]
     if not snapshots:
         raise ValueError("trajectory has no stored fields; simulate with keep_fields=True")
 
     plotstyle.use_style()
-    model, grid = trajectory.model, trajectory.tissue.grid
+    model = trajectory.model
+    grid = model.grid if trajectory.tissue is None else trajectory.tissue.grid   # loaded runs carry no tissue
     fig, left = plt.subplots(figsize=(6.2, 5.6))
+
+    shifts = drift_shifts(trajectory, snapshots) if comoving else np.zeros((len(snapshots), 2))
+    spacing = np.array([grid.dx, grid.dy])
+    pixels = np.rint(shifts / spacing).astype(int)                  # (x, y) grid points
 
     auto_low, auto_high = colour_limits(snapshots, transient)
     floor = auto_low if vmin is None else vmin
@@ -211,6 +240,9 @@ def make_animation(trajectory, fps=20, transient=0.2, vmin=None, vmax=None):
     image = field_image(left, snapshots[0].field, grid, vmin=floor, vmax=ceiling,
                         colorbar=fig)
     markers, = left.plot([], [], ".", color=plotstyle.INK, ms=3)
+    # The minority cells, if any, get a ring so they can be followed through the tissue.
+    minority = np.arange(getattr(model, "minority_count", 0))
+    rings, = left.plot([], [], "o", mfc="none", mec=plotstyle.SERIES[1], mew=1.2, ms=9)
 
     title = fig.suptitle("", x=0.01, ha="left", fontsize=9,
                          fontweight="semibold", color=plotstyle.INK)
@@ -218,18 +250,23 @@ def make_animation(trajectory, fps=20, transient=0.2, vmin=None, vmax=None):
         f"{model.n_cells} cells   $\\alpha$={model.alpha:g} $K$={model.K:g} "
         f"$\\epsilon$={model.epsilon:g} $\\lambda$={model.area_lambda:g} "
         f"$\\gamma$={model.friction:g} $v_0$={model.speed:g}"
+        + ("   co-moving frame" if comoving else "")
     )
 
     def draw(index):
         snapshot = snapshots[index]
-        image.set_data(snapshot.field)
-        markers.set_data(snapshot.centres[:, 0], snapshot.centres[:, 1])
+        shift_x, shift_y = pixels[index]
+        field = np.roll(snapshot.field, (-shift_y, -shift_x), axis=(0, 1))
+        centres = grid.box.wrap(snapshot.centres - pixels[index] * spacing)
+        image.set_data(field)
+        markers.set_data(centres[:, 0], centres[:, 1])
+        rings.set_data(centres[minority, 0], centres[minority, 1])
         left.set_title(f"$t$ = {snapshot.time:.1f}", loc="left", pad=8)
         title.set_text(
             f"{header}   |   $A/A_0$ {snapshot.area_ratio:.3f}   "
             f"$q$ {snapshot.shape_index:.2f}"
         )
-        return image, markers
+        return image, markers, rings
 
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     return animation.FuncAnimation(fig, draw, frames=len(snapshots),
@@ -263,6 +300,17 @@ def observables_figure(series, label, reported):
 
     for index, (key, title) in enumerate(reported):
         ax = axes[index // columns][index % columns]
+        # Separations stop at half the box, so a correlation length sitting on that
+        # bound is a lower bound, not a measurement. The bound is drawn as a line only
+        # when some length comes within 70% of it; otherwise it would sit far above
+        # the data and squash it, and a note in the corner says what it was.
+        bounded = (key.startswith("velocity_correlation_length")
+                   and all("velocity_correlation_bound" in s for e in series for s in e["states"]))
+        if bounded:
+            tallest = max(s[key] for e in series for s in e["states"] if np.isfinite(s[key])) \
+                if any(np.isfinite(s[key]) for e in series for s in e["states"]) else 0.0
+            lowest_bound = min(s["velocity_correlation_bound"] for e in series for s in e["states"])
+            near_bound = tallest > 0.7 * lowest_bound
         for order, entry in enumerate(series):
             colour = (plotstyle.SERIES[index % len(plotstyle.SERIES)] if single
                       else ramp[order])
@@ -273,11 +321,13 @@ def observables_figure(series, label, reported):
             else:
                 ax.errorbar(values, heights, yerr=[s[key] for s in entry["spreads"]],
                             fmt="o-", color=colour, ms=5, capsize=3, label=entry.get("name"))
-            if key.startswith("velocity_correlation_length") and "velocity_correlation_bound" in entry["states"][0]:
-                # Separations stop at half the box, so a length sitting on this line
-                # is only a lower bound, not a measurement.
+            if bounded and near_bound:
                 ax.plot(values, [s["velocity_correlation_bound"] for s in entry["states"]],
                         color=plotstyle.INK_MUTED, lw=0.8, ls=":")
+        if bounded and not near_bound:
+            ax.text(0.98, 0.95, f"half box {lowest_bound:.0f} um", transform=ax.transAxes,
+                    ha="right", va="top", fontsize=7, color=plotstyle.INK_MUTED)
+            ax.set_ylim(bottom=0.0)
         ax.set_title(title, loc="left", pad=6, fontsize=9)
         ax.set_xlabel(label)
         ax.grid(axis="y")
@@ -288,6 +338,9 @@ def observables_figure(series, label, reported):
                 ax.axhline(level, color=plotstyle.INK_MUTED, lw=0.8, ls=style)
         if key == "occupancy":
             ax.axhline(1.4, color=plotstyle.SERIES[1], lw=0.8, ls=":")
+        if key == "neighbour_persistence_time":
+            # A value at the longest lag the run allows is a lower bound: the solid.
+            ax.set_yscale("log")
         if index == 0 and not single:
             ax.legend(loc="best")
 

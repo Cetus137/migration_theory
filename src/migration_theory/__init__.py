@@ -19,6 +19,7 @@ from .analysis import (
     mean_squared_displacement,
     neighbour_exchange_rate,
     neighbour_graph,
+    neighbour_persistence,
     pair_correlation,
     persistent_random_walk,
     shape_statistics,
@@ -27,7 +28,11 @@ from .analysis import (
     tracks,
     velocities,
     velocity_correlation,
+    velocity_correlation_split,
     velocity_correlations,
+    cage_relative_motion,
+    population_state,
+    minority_state,
 )
 from .box import PeriodicBox
 from .dynamics import Diverged, ExplicitEuler, UnstableTimestep, run
@@ -38,6 +43,7 @@ from .diagnostics import (
     contact_lengths,
     overlap_matrix,
     perimeters,
+    shape_index,
     shape_indices,
 )
 from .fields import PhaseFields, Windows, seed, seed_tessellated
@@ -49,6 +55,7 @@ from .free_energy import (
     FreeEnergyTerm,
     GradientEnergy,
     Repulsion,
+    ball_volume,
     interface_terms,
     interface_width,
     surface_tension,
@@ -105,12 +112,14 @@ __all__ = [
     "mean_squared_displacement",
     "neighbour_exchange_rate",
     "neighbour_graph",
+    "neighbour_persistence",
     "persistent_random_walk",
     "shape_statistics",
     "tissue_state",
     "tracks",
     "contact_lengths",
     "evenly_spaced",
+    "ball_volume",
     "interface_terms",
     "interface_width",
     "surface_tension",
@@ -121,6 +130,7 @@ __all__ = [
     "passive_forces",
     "perimeters",
     "structure",
+    "shape_index",
     "shape_indices",
     "simulate",
     "poisson_disc",
@@ -132,5 +142,9 @@ __all__ = [
     "triangular_lattice",
     "velocities",
     "velocity_correlation",
+    "velocity_correlation_split",
     "velocity_correlations",
+    "cage_relative_motion",
+    "population_state",
+    "minority_state",
 ]
